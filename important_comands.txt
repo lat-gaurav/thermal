@@ -1,0 +1,4 @@
+when you are connected the jetson to laptop with ethernet cable , and want to use the ethernet cable for the internet in the jetson and not the wifi , this specific command works for my laptop mac and the jetson on the gimbal setup.
+
+sudo ip route add default via 192.168.2.1 dev enP8p1s0 metric 50
+
