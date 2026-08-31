@@ -226,6 +226,81 @@ def send(port, code, timeout=3.0):
     return rx, None
 
 
+def send_retry(rate, secs, explicit_port=None, gap=1.0):
+    """Retry until the core answers or SECS elapse.
+
+    The core does not answer on every enumeration: observed silent across ~40
+    attempts on several instances, then answering twice in a row on another,
+    with the video path healthy throughout. Since a replug sometimes lands in a
+    talking state, retrying across replugs is more effective than any single
+    hand-timed attempt. The port disappearing mid-run is expected here, not an
+    error -- it just means the device is being replugged, so wait for it.
+    """
+    import serial as _serial          # noqa: F401  (fail early if missing)
+    deadline = time.time() + secs
+    code = CODE[rate]
+    attempt = 0
+    last = None
+    print("retrying    up to %.0f s for %d fps (code 0x%02X); replug the camera"
+          " to force a fresh enumeration" % (secs, rate, code))
+    while time.time() < deadline:
+        attempt += 1
+        hits = sorted(glob.glob(PORT_GLOB)) if not explicit_port else [explicit_port]
+        if not hits:
+            if last != "absent":
+                print("  waiting for the port to appear ...")
+                last = "absent"
+            time.sleep(gap)
+            continue
+        port = hits[0]
+        try:
+            rx, err = send_quiet(port, code)
+        except Exception as e:                       # noqa: BLE001
+            rx, err = b"", "%s" % type(e).__name__
+        if err is None:
+            print("  attempt %d on %s" % (attempt, port))
+            print("  RX  %s" % hx(rx))
+            return rx, None, port
+        if err != last:
+            print("  attempt %d: %s" % (attempt, err))
+            last = err
+        time.sleep(gap)
+    return b"", ("no reply after %.0f s (%d attempts) -- the core never answered"
+                 % (secs, attempt)), None
+
+
+def send_quiet(port, code, timeout=2.0):
+    """send() without the per-attempt TX/RX printing, for the retry loop."""
+    import serial
+    tx = build(code)
+    with serial.Serial(port, BAUD, bytesize=8, parity="N", stopbits=1,
+                       timeout=0.3) as ser:
+        time.sleep(0.2)
+        ser.reset_input_buffer()
+        ser.write(tx)
+        ser.flush()
+        deadline = time.time() + timeout
+        rx = b""
+        while time.time() < deadline and len(rx) < 9:
+            chunk = ser.read(9 - len(rx))
+            if chunk:
+                rx += chunk
+                deadline = time.time() + timeout
+    if not rx:
+        return rx, "no reply"
+    if len(rx) < 9:
+        return rx, "short reply (%d bytes)" % len(rx)
+    if rx[0] != 0x55 or rx[1] != 0x05:
+        return rx, "bad header %02X %02X" % (rx[0], rx[1])
+    if (sum(rx[0:6]) & 0xFF) != rx[6]:
+        return rx, "checksum mismatch"
+    if rx[3] != code:
+        return rx, "wrong code echoed %02X" % rx[3]
+    if rx[2] != 0x00:
+        return rx, "status 0x%02X (failure)" % rx[2]
+    return rx, None
+
+
 def measure(frames=200, dev=None):
     """Time frames actually delivered. Needs the camera free -- see service_active()."""
     if dev is None:
@@ -292,6 +367,11 @@ def main():
     ap.add_argument("--dev", help="override the auto-detected video capture node")
     ap.add_argument("--force", action="store_true",
                    help="proceed even though %s is running" % SERVICE)
+    ap.add_argument("--retry", type=float, metavar="SECS", default=0,
+                   help="keep retrying for SECS until the core answers, waiting for\n"
+                        "the port to appear if it is absent. The core has been seen\n"
+                        "to answer on only some enumerations, so this catches the\n"
+                        "window after a replug instead of needing a hand-timed run.")
     a = ap.parse_args()
 
     if a.list:
@@ -337,10 +417,15 @@ def main():
               "            below is a no-op -- nothing checked whether something else\n"
               "            is streaming from the core." % SERVICE)
 
-    port = find_port(a.port)
-    print("port        %s" % port)
-    print("setting     %d fps (control code 0x%02X)" % (a.rate, CODE[a.rate]))
-    rx, err = send(port, CODE[a.rate])
+    if a.retry > 0:
+        rx, err, port = send_retry(a.rate, a.retry, a.port)
+        if port is None:
+            port = a.port          # nothing answered; fall back to the override
+    else:
+        port = find_port(a.port)
+        print("port        %s" % port)
+        print("setting     %d fps (control code 0x%02X)" % (a.rate, CODE[a.rate]))
+        rx, err = send(port, CODE[a.rate])
     if err:
         print("FAILED: %s" % err)
         return 1

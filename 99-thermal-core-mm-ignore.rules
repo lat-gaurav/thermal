@@ -1,0 +1,14 @@
+# Keep ModemManager away from the SD-IRM-256-01 thermal core's control port.
+#
+# The core exposes a CDC-ACM port for its 9-byte binary command protocol. That
+# looks like a modem to ModemManager, which opens it as an AT port and probes it
+# with AT strings -- observed in the journal as:
+#     [ttyACM0/at] open blocked by driver for more than 7 seconds!
+#     plugin-manager task 6,ttyACM0: checking support with plugin 'iridium'
+# While it holds the port, opening it fails with EBUSY (errno 16), and its AT
+# probes are written into a device that speaks a binary protocol.
+#
+# Matched on product string as well as VID/PID: 1d6b is the generic Linux gadget
+# vendor ID, so VID/PID alone is not specific enough to be safe.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0101", ATTRS{product}=="Sirius", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0101", ATTRS{product}=="Sirius", ENV{ID_MM_PORT_IGNORE}="1"

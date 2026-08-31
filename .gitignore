@@ -1,0 +1,14 @@
+# Raw captures: ~43 MB/s, ~155 GB/hour. Never commit these.
+recordings/
+
+# Compiled binary; rebuild with:
+#   gcc -O2 -Wall -Wextra -o record_raw record_raw.c
+record_raw
+sync_log
+tlm_log
+flow_post
+flow_live
+record_sync
+
+# Python bytecode
+__pycache__/
