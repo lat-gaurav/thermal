@@ -1,4 +1,109 @@
-when you are connected the jetson to laptop with ethernet cable , and want to use the ethernet cable for the internet in the jetson and not the wifi , this specific command works for my laptop mac and the jetson on the gimbal setup.
+when you are connected the jetson to laptop with 
+ethernet cable , and want to use the ethernet cable for 
+the internet in the jetson and not the wifi ,
+this specific command works for my 
+laptop mac and the jetson on the gimbal setup.
 
-sudo ip route add default via 192.168.2.1 dev enP8p1s0 metric 50
+       -->  sudo ip route add default via 192.168.2.1 dev enP8p1s0 metric 50
 
+
+
+-------------------------------------------------------------------
+blob_log -- IMU at ~1 kHz + blob detection at camera fps + preview
+-------------------------------------------------------------------
+
+build:  gcc -O2 -Wall -Wextra -o blob_log blob_log.c -lpthread -ljpeg -lm
+
+  ./blob_log -t 30 -S 2              # 30 s run, cheap detection, preview on 8080
+  ./blob_log -S 2                    # until Ctrl-C
+  ./blob_log -S 2 -p 0               # no preview at all (lowest load)
+  ./blob_log -t 30 -T 200            # fixed threshold instead of adaptive
+
+then from the laptop:   http://<jetson-ip>:8080/
+
+writes recordings/<date>/<time>/{imu.csv, blobs.csv, summary.txt}
+
+  -S 2 is the one flag worth remembering: detection costs 5.5 ms/frame
+  instead of 20.6, and loses nothing real -- the sensor is 640x512 and the
+  1280x1024 stream is a 2x upscale. Coordinates stay in full-frame px.
+
+priority order is enforced by design:
+  frames > imu > detection > preview.   Only the preview ever drops.
+
+
+-------------------------------------------------------------------
+det_latency -- world movement -> detection output, IMU as truth
+-------------------------------------------------------------------
+
+build:  gcc -O2 -Wall -Wextra -o det_latency det_latency.c -lm
+
+  1. record, while panning the gimbal:
+       ./blob_log -t 30 -S 2
+  2. measure:
+       ./det_latency -d recordings/<date>/<time>
+       ./det_latency -d recordings/<date>/<time> -v     # show the loss curve
+
+THE PAN IS THE EXPERIMENT. Smooth back and forth, a few degrees each
+way, 0.3-1 Hz, 20-30 s, aimed at something warm and STATIONARY.
+Peak rate must stay in 10-50 deg/s.
+
+  A VIOLENT JERK IS THE WORST CASE, NOT THE BEST.
+  At 270 deg/s the image shifts ~200 px between frames and smears, the
+  tracker locks onto the wrong feature, and it reports high quality
+  while doing it. Verified on the 1726xx runs: dx_px read 0.01 px while
+  the gimbal swung 9.67 deg. Filtering cannot rescue such a record --
+  the only slow frames are the turnaround instants.
+  This is why the old jerk-onset latencies (1.91/3.05/5.86/5.84/2.72
+  frames) never reproduced.
+
+reading the result: it refuses rather than guessing. R^2 must be >0.5,
+the minimum inside the sweep, scale ~18.6 px/deg, conformality <0.35.
+  low R^2 + GOOD scale/conformality  = the target itself is moving
+  low scale + high conformality      = tracker lost lock (pan slower)
+
+validated against synthetic data with known lag: 0/20/45/80/120 ms
+recovered to within 1.6 ms.
+
+
+-------------------------------------------------------------------
+imu_live -- live yaw/pitch + pan-rate coaching
+-------------------------------------------------------------------
+
+build:  gcc -O2 -Wall -Wextra -o imu_live imu_live.c -lm
+
+  ./imu_live            # live line, colour-coded band verdict
+  ./imu_live -p         # one line per update, for logs
+  ./imu_live -a         # also show all 8 telemetry floats
+
+Shows yaw/pitch, angular rate, and px/frame with a band verdict.
+Pan until it reads IDEAL (25-45 px/frame).
+
+  DO NOT run this while blob_log is recording. Both read the same
+  tty and each steals the other's bytes -- measured: blob_log drops
+  to 780 Hz with 182 crc errors. imu_live now detects this and warns.
+
+-------------------------------------------------------------------
+Recording for det_latency -- the two rules that actually matter
+-------------------------------------------------------------------
+
+1. KEEP THE TOTAL SWEEP UNDER ~33 deg.
+   FOV is 46.8 deg (27 px/deg over 1280 px). A 51.8 deg sweep needs
+   1400 px of travel through a 1280 px frame, so the target LEAVES
+   the frame and the detector locks onto a different hot object:
+   747 px cx jumps that no gimbal motion can explain. That wrecked
+   run 193250 (R2 0.645). Run 191357 swept 45 deg and got 0.998.
+
+2. PEAK RATE 30-40 deg/s. Both runs peaked at 105 deg/s and 191357
+   was still fine, so this matters less than the sweep width -- but
+   above ~137 deg/s the tracker loses lock outright.
+
+det_latency now rejects track breaks automatically (4 sigma) and
+re-sweeps; that alone took 193250 from R2 0.645 to 0.9986.
+It also warns when the sweep exceeds the field of view.
+
+RESULT SO FAR (25 fps, -S 1):
+  [A] world -> first byte   92.4 and 95.3 ms  (two runs, +-1 ms each)
+  [B] first byte -> avail   35.4 ms   (USB transfer, 1.31 MB)
+  [C] avail -> detect start  0.03 ms
+  [D] detection            18.2 ms (-S 1) / 4.9 ms (-S 2)
+  TOTAL                    ~147 ms  (~134 ms with -S 2)
