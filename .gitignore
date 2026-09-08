@@ -2,8 +2,8 @@
 recordings/
 
 # Compiled binary; rebuild with:
-#   gcc -O2 -Wall -Wextra -o record_raw record_raw.c
-record_raw
+#   gcc -O2 -Wall -Wextra -o bin/record_raw tools/record_raw.c
+bin/record_raw
 sync_log
 tlm_log
 flow_post

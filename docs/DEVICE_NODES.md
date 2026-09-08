@@ -22,7 +22,7 @@ assigned in enumeration order and they move. Use the by-id paths below.
 
 ```bash
 ./set_fps_jetson.py --list     # prints the camera's resolved video + serial paths
-./check_gimbal.py              # prints the gimbal's resolved path and link health
+./calibration/check_gimbal.py              # prints the gimbal's resolved path and link health
 ```
 
 ---

@@ -12,12 +12,12 @@ laptop mac and the jetson on the gimbal setup.
 blob_log -- IMU at ~1 kHz + blob detection at camera fps + preview
 -------------------------------------------------------------------
 
-build:  gcc -O2 -Wall -Wextra -o blob_log blob_log.c -lpthread -ljpeg -lm
+build:  gcc -O2 -Wall -Wextra -o bin/blob_log tools/blob_log.c -lpthread -ljpeg -lm
 
-  ./blob_log -t 30 -S 2              # 30 s run, cheap detection, preview on 8080
-  ./blob_log -S 2                    # until Ctrl-C
-  ./blob_log -S 2 -p 0               # no preview at all (lowest load)
-  ./blob_log -t 30 -T 200            # fixed threshold instead of adaptive
+  ./bin/blob_log -t 30 -S 2              # 30 s run, cheap detection, preview on 8080
+  ./bin/blob_log -S 2                    # until Ctrl-C
+  ./bin/blob_log -S 2 -p 0               # no preview at all (lowest load)
+  ./bin/blob_log -t 30 -T 200            # fixed threshold instead of adaptive
 
 then from the laptop:   http://<jetson-ip>:8080/
 
@@ -35,13 +35,13 @@ priority order is enforced by design:
 det_latency -- world movement -> detection output, IMU as truth
 -------------------------------------------------------------------
 
-build:  gcc -O2 -Wall -Wextra -o det_latency det_latency.c -lm
+build:  gcc -O2 -Wall -Wextra -o bin/det_latency calibration/det_latency.c -lm
 
   1. record, while panning the gimbal:
-       ./blob_log -t 30 -S 2
+       ./bin/blob_log -t 30 -S 2
   2. measure:
-       ./det_latency -d recordings/<date>/<time>
-       ./det_latency -d recordings/<date>/<time> -v     # show the loss curve
+       ./bin/det_latency -d recordings/<date>/<time>
+       ./bin/det_latency -d recordings/<date>/<time> -v     # show the loss curve
 
 THE PAN IS THE EXPERIMENT. Smooth back and forth, a few degrees each
 way, 0.3-1 Hz, 20-30 s, aimed at something warm and STATIONARY.
@@ -69,11 +69,11 @@ recovered to within 1.6 ms.
 imu_live -- live yaw/pitch + pan-rate coaching
 -------------------------------------------------------------------
 
-build:  gcc -O2 -Wall -Wextra -o imu_live imu_live.c -lm
+build:  gcc -O2 -Wall -Wextra -o bin/imu_live tools/imu_live.c -lm
 
-  ./imu_live            # live line, colour-coded band verdict
-  ./imu_live -p         # one line per update, for logs
-  ./imu_live -a         # also show all 8 telemetry floats
+  ./bin/imu_live            # live line, colour-coded band verdict
+  ./bin/imu_live -p         # one line per update, for logs
+  ./bin/imu_live -a         # also show all 8 telemetry floats
 
 Shows yaw/pitch, angular rate, and px/frame with a band verdict.
 Pan until it reads IDEAL (25-45 px/frame).

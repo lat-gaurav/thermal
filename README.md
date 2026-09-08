@@ -54,14 +54,15 @@ cutting detection from 18.2 ms to 4.9 ms.
 No build system; each tool is one translation unit.
 
 ```bash
-gcc -O2 -Wall -Wextra -o record_raw   record_raw.c
-gcc -O2 -Wall -Wextra -o blob_log     blob_log.c     -lpthread -ljpeg -lm
-gcc -O2 -Wall -Wextra -o det_latency  det_latency.c  -lm
-gcc -O2 -Wall -Wextra -o imu_live     imu_live.c     -lm
-gcc -O2 -Wall -Wextra -o view_camera  view_camera.c  -lpthread -ljpeg
-gcc -O2 -Wall -Wextra -o detect_blob  detect_blob.c  -lm
-gcc -O2 -Wall -Wextra -o flow_stamp   flow_stamp.c   -lpthread -lm
-gcc -O2 -Wall -Wextra -o jerk_latency jerk_latency.c -lm
+mkdir -p bin
+gcc -O2 -Wall -Wextra -o bin/record_raw   tools/record_raw.c
+gcc -O2 -Wall -Wextra -o bin/blob_log     tools/blob_log.c     -lpthread -ljpeg -lm
+gcc -O2 -Wall -Wextra -o bin/det_latency  calibration/det_latency.c  -lm
+gcc -O2 -Wall -Wextra -o bin/imu_live     tools/imu_live.c     -lm
+gcc -O2 -Wall -Wextra -o bin/view_camera  tools/view_camera.c  -lpthread -ljpeg
+gcc -O2 -Wall -Wextra -o bin/detect_blob  calibration/detect_blob.c  -lm
+gcc -O2 -Wall -Wextra -o bin/flow_stamp   calibration/flow_stamp.c   -lpthread -lm
+gcc -O2 -Wall -Wextra -o bin/jerk_latency calibration/jerk_latency.c -lm
 ```
 
 All eight compile with zero warnings. `libjpeg-dev` is the only non-libc
@@ -86,8 +87,8 @@ QBUF`; every branch out of it ends in a `QBUF`, so no downstream stage can hold
 a buffer hostage. Only the preview is designed to lose data.
 
 ```bash
-./blob_log -t 30 -S 2            # 30 s, cheap detection, preview on :8080
-./blob_log -S 2 -p 0             # no preview, lowest load
+./bin/blob_log -t 30 -S 2            # 30 s, cheap detection, preview on :8080
+./bin/blob_log -S 2 -p 0             # no preview, lowest load
 ```
 
 Writes `recordings/<date>/<time>/` → `imu.csv`, `blobs.csv`, `summary.txt`.
@@ -106,7 +107,7 @@ pan speed is one the tracker can follow. It shows **px/frame**, which is the
 quantity that actually decides whether a recording is usable.
 
 ```bash
-./imu_live          # pan until it reads IDEAL
+./bin/imu_live          # pan until it reads IDEAL
 ```
 
 **`view_camera`** — MJPEG preview over HTTP with no detection.
@@ -154,8 +155,8 @@ time shift τ backwards, fit that relation at each τ, and the τ that minimises
 residual is the latency.
 
 ```bash
-./blob_log -t 30 -S 2                              # record, while panning
-./det_latency -d recordings/<date>/<time> -v       # measure
+./bin/blob_log -t 30 -S 2                              # record, while panning
+./bin/det_latency -d recordings/<date>/<time> -v       # measure
 ```
 
 ### Why a joint 2×2 fit
@@ -241,15 +242,15 @@ move** — during one debugging session the camera cycled through device numbers
 the camera had occupied.
 
 Every tool resolves by USB serial through a fallback chain and never by kernel
-name. See **[DEVICE_NODES.md](DEVICE_NODES.md)** for the full topology, the
+name. See **[DEVICE_NODES.md](docs/DEVICE_NODES.md)** for the full topology, the
 `video0`/`video1` metadata-node trap, and the udev rules.
 
-**[THERMAL_SERIAL_FAULT.md](THERMAL_SERIAL_FAULT.md)** documents a four-day
+**[THERMAL_SERIAL_FAULT.md](docs/THERMAL_SERIAL_FAULT.md)** documents a four-day
 outage of the camera's serial channel caused by ModemManager AT-probing the
 CDC-ACM port, and the udev rule that fixes it
 (`99-thermal-core-mm-ignore.rules`, installed to `/etc/udev/rules.d/`).
 
-**[important_comands.txt](important_comands.txt)** is the working command
+**[important_comands.txt](docs/important_comands.txt)** is the working command
 reference — recipes, network setup, and the recording rules above.
 
 ---
