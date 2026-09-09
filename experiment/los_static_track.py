@@ -55,6 +55,9 @@ import cv2
 import numpy as np
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import config
 
 
 def _load_rawrec_viewer():
@@ -152,35 +155,15 @@ def interp_quat(t_target, quat_rows, ts):
     return tuple(slerp(quat_rows[j - 1][1:], quat_rows[j][1:], frac))
 
 
-INITIAL_LATENCY_S = -0.070  # world moves -> attitude lookup point. A companion
-                           # rig's own two credible phase-correlation runs gave
-                           # +150 ms (corr 0.545, scale 0.857) and +200 ms
-                           # (corr 0.620, scale 0.826); this is their midpoint.
-                           # A third run on that rig gave -78.5 ms but with
-                           # corr -0.048 and scale -0.064 -- by its own
-                           # validity check (scale near +/-1.0) that run was
-                           # noise, not a measurement, and is disregarded.
-                           # Not measured on this airframe -- just a starting
-                           # point for the live '[' / ']' tuning below.
-LATENCY_STEP_S = 0.010     # 5 ms per key press
-MIN_LATENCY_S = -0.5
-MAX_LATENCY_S = 0.5
+# Tunables live in config.py -- see it for the reasoning (the phase-
+# correlation measurements the latency starting point came from, the R_bc
+# extrinsics measurement, etc).
+INITIAL_LATENCY_S = config.LOS_LATENCY_S
+LATENCY_STEP_S = config.LOS_LATENCY_STEP_S
+MIN_LATENCY_S = config.LOS_MIN_LATENCY_S
+MAX_LATENCY_S = config.LOS_MAX_LATENCY_S
 
-# Measured camera-to-body extrinsic rotation, from a companion rig's
-# extrinsics.json (R_bc): rotates a vector in the SENSOR frame (X=boresight,
-# Y=image-right, Z=image-down) into BODY FRD (X=forward, Y=right, Z=down) --
-# the quaternion's own convention. This is roll (90, validated by correlating
-# predicted vs. observed image motion over 524 frame pairs: +90 gave corr
-# +0.735, -90 gave -0.735) and pitch (25 up) TOGETHER with the axis reorder
-# from (right, down, forward) to (forward, right, down) -- not a pure roll
-# composed with a pure pitch in image-axis order, which is what an earlier
-# version of this file used and which a direct numeric check against R_bc
-# below showed was wrong by up to 2.0 in matrix entries, not just a sign.
-R_BC = np.array([
-    [0.906307787037, -0.422618261741, 0.0],
-    [0.0, 0.0, 1.0],
-    [-0.422618261741, -0.906307787037, 0.0],
-])
+R_BC = np.array(config.MOUNT_R_BC)
 
 # Permutation from this file's image-ray axes (x=right, y=down, z=forward)
 # into the sensor-frame axis order R_BC expects (X=forward, Y=right, Z=down).
@@ -227,6 +210,150 @@ def project(ref_uv, ref_q, cur_q, focal, cx, cy):
     if r1_img[2] <= 1e-6:
         return None
     return cx + focal * r1_img[0] / r1_img[2], cy + focal * r1_img[1] / r1_img[2]
+
+
+class SmoothTracker:
+    """Fuses the LOS (attitude-only) prediction with detector output, blended
+    smoothly frame to frame -- replaces a periodic hard re-anchor, which
+    either trusts one old click forever or teleports the reference straight
+    onto a raw detection the moment it fires.
+
+    Every update(): PREDICT the reference forward by attitude alone
+    (project()), then look for a detector candidate within a gate sized by
+    how long it's been since the last good fix AND by how fast the camera is
+    actually rotating (angular rate widens the gate and discounts detector
+    confidence -- both LOS reprojection and the detector's own confidence are
+    known to degrade at high angular rate: interpolation/timing error grows
+    with rotation rate, and a fast-moving target smears across the detector's
+    top-hat kernel). If a candidate is accepted, the reference is pulled
+    toward it by a gain capped at ALPHA_MAX -- never fully replaced -- so a
+    single frame can only ever partially correct the estimate. That cap is
+    what makes a visible jump structurally impossible, not just unlikely.
+
+    boxes passed to update() must be (x, y, w, h, score) -- score is
+    detector confidence, higher meaning more trustworthy.
+    """
+
+    # All tunables live in config.py -- see it for why each is set the way
+    # it is (CONF_REF in particular: it's what keeps a strong-but-farther
+    # detection from automatically beating a weak-but-closer one, by
+    # folding distance and confidence into [0, 1] before comparing them).
+    BASE_GATE_PX = config.TRACKER_BASE_GATE_PX
+    GATE_PX_PER_FRAME = config.TRACKER_GATE_PX_PER_FRAME
+    GATE_PX_PER_DEG_S = config.TRACKER_GATE_PX_PER_DEG_S
+    MAX_GATE_PX = config.TRACKER_MAX_GATE_PX
+    OMEGA_REF_DEG_S = config.TRACKER_OMEGA_REF_DEG_S
+    CONF_REF = config.TRACKER_CONF_REF
+    ALPHA_MAX = config.TRACKER_ALPHA_MAX
+    MISS_GAIN = config.TRACKER_MISS_GAIN
+
+    def __init__(self, quats, frame_times, focal, cx, cy, project_fn):
+        self.quats = quats
+        self.frame_times = frame_times
+        self.focal = focal
+        self.cx = cx
+        self.cy = cy
+        self.project = project_fn
+        self.ref = None  # {"frame_idx": int, "uv": (x, y)}
+        self.misses = 0
+        self.status = "none"  # "none" | "tracking" | "coasting"
+
+    def set_click(self, frame_idx, uv):
+        self.ref = {"frame_idx": frame_idx, "uv": uv}
+        self.misses = 0
+        self.status = "tracking"
+
+    def _omega_deg_s(self, i0, i1):
+        if self.quats is None or i0 == i1:
+            return 0.0
+        dot = abs(sum(a * b for a, b in zip(self.quats[i0], self.quats[i1])))
+        dot = min(1.0, max(-1.0, dot))
+        theta_deg = np.degrees(2 * np.arccos(dot))
+        dt = abs(self.frame_times[i1] - self.frame_times[i0])
+        return theta_deg / dt if dt > 0 else 0.0
+
+    def point(self, frame_idx):
+        """Current predicted image position for frame_idx, or None."""
+        if self.ref is None or self.quats is None:
+            return None
+        if frame_idx == self.ref["frame_idx"]:
+            return self.ref["uv"]
+        return self.project(self.ref["uv"], self.quats[self.ref["frame_idx"]],
+                             self.quats[frame_idx], self.focal, self.cx, self.cy)
+
+    def gate_px(self, frame_idx):
+        """Current acceptance-gate radius (px) for frame_idx, or None with no
+        reference yet. Public so a caller can size a search crop around
+        point(frame_idx) before running a detector, rather than searching
+        the whole frame once the tracker actually knows roughly where to
+        look."""
+        if self.ref is None or self.quats is None:
+            return None
+        omega = self._omega_deg_s(self.ref["frame_idx"], frame_idx)
+        elapsed = abs(frame_idx - self.ref["frame_idx"])
+        return min(self.MAX_GATE_PX, self.BASE_GATE_PX
+                   + self.GATE_PX_PER_FRAME * elapsed + self.GATE_PX_PER_DEG_S * omega)
+
+    def update(self, frame_idx, boxes):
+        """Advance the tracker to frame_idx: predict, gate against boxes, blend."""
+        if self.ref is None or self.quats is None or frame_idx == self.ref["frame_idx"]:
+            return
+
+        predicted = self.point(frame_idx)
+        if predicted is None:
+            self.status = "coasting"
+            return  # can't propagate (behind camera / off-frame) -- try again next frame
+        px, py = predicted
+
+        omega = self._omega_deg_s(self.ref["frame_idx"], frame_idx)
+        gate = self.gate_px(frame_idx)
+        conf_scale = 1.0 / (1.0 + omega / self.OMEGA_REF_DEG_S)
+
+        best, best_cost = None, None
+        for box in boxes:
+            x, y, w, h, score = box
+            bx, by = x + w / 2.0, y + h / 2.0
+            d = ((bx - px) ** 2 + (by - py) ** 2) ** 0.5
+            if d > gate:
+                continue
+            eff_conf = max(score * conf_scale, 0.0)
+            dist_term = d / gate                                   # in [0, 1]
+            conf_term = 1.0 - min(eff_conf / self.CONF_REF, 1.0)   # in [0, 1]
+            cost = dist_term + conf_term                            # in [0, 2]
+            if best is None or cost < best_cost:
+                best, best_cost = (bx, by), cost
+
+        if best is None:
+            self.ref = {"frame_idx": frame_idx, "uv": (px, py)}
+            self.misses += 1
+            self.status = "coasting"
+            return
+
+        match_quality = 1.0 - best_cost / 2.0  # cost in [0, 2] -> quality in [0, 1]
+        alpha = min(self.ALPHA_MAX, max(0.0, match_quality) * (1.0 + self.MISS_GAIN * self.misses))
+        blended = (px + alpha * (best[0] - px), py + alpha * (best[1] - py))
+        self.ref = {"frame_idx": frame_idx, "uv": blended}
+        self.misses = 0
+        self.status = "tracking"
+
+
+# Tunable lives in config.py -- see it for why it's set the way it is.
+CROP_MARGIN_PX = config.TRACKER_CROP_MARGIN_PX
+
+
+def crop_bounds(cx, cy, radius, w, h):
+    """Clamped (x0, y0, x1, y1) crop window of the given radius around (cx, cy),
+    or None if the point has drifted entirely outside the frame -- clamping
+    x0 and x1 independently doesn't stop x0 from landing past x1 (or beyond w
+    entirely) when cx is more than radius past the right/bottom edge, which
+    would otherwise hand a detector an empty array and crash it."""
+    x0 = max(0, int(cx - radius))
+    y0 = max(0, int(cy - radius))
+    x1 = min(w, int(cx + radius))
+    y1 = min(h, int(cy + radius))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
 
 
 def main():

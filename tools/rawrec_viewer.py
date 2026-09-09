@@ -5,6 +5,8 @@
 
 KEYS
     click           set/replace the LOS reference point at the current frame
+    i               auto-init the LOS reference here (no click) -- runs
+                    whichever strategy is loaded from initialisation/
     right / n / .   next frame
     left / p / ,    previous frame
     space           play / pause
@@ -19,7 +21,10 @@ window to jump straight to a frame number.
 
 Detectors are loaded from the detector/ folder next to this repo: any .py file
 there exposing a detect(frame) -> [(x, y, w, h), ...] function is picked up
-automatically.
+automatically. Auto-init strategies work the same way from initialisation/:
+any .py file exposing init(boxes) -> (x, y) | None. Only the first one found
+is used for now (sorted by filename) -- multiple strategies can coexist in
+the folder, picking which one runs isn't wired up yet.
 
 If a matching los-*.csv is found (see experiment/los_static_track.py for the
 matching/attitude math, reused here), clicking on the image marks a point
@@ -27,9 +32,10 @@ assumed static in the world; every other frame then shows where gimbal
 attitude alone predicts that point should be, drawn as a small cross. This
 is the same input filters/ folder detections get filtered against -- any
 .py file there exposing a filter(boxes, context) -> boxes function runs on
-the detector's output every frame, context["los_point"] being that
-prediction (or None if no reference is set / no los data exists for this
-file).
+the detector's output every frame. context carries "los_point" (that
+prediction, or None if no reference is set / no los data exists for this
+file) and "frame_w"/"frame_h" (the frame's own dimensions, for a filter that
+needs to reason about the image border).
 """
 import argparse
 import importlib.util
@@ -44,8 +50,13 @@ import cv2
 import numpy as np
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import config
+
 DETECTOR_DIR = REPO_ROOT / "detector"
 FILTER_DIR = REPO_ROOT / "filters"
+INIT_DIR = REPO_ROOT / "initialisation"
 
 FILE_HDR = 4096            # bytes of file header before the first record
 REC_MAGIC = 0xA5F00DEC     # per-record header magic, little-endian u32
@@ -59,27 +70,17 @@ SLOWER_KEYS = (ord('['),)
 FASTER_KEYS = (ord(']'),)
 DETECTOR_KEYS = (ord('d'),)
 ANNOTATE_KEYS = (ord('a'),)
+AUTOINIT_KEYS = (ord('i'),)
 QUIT_KEYS = (27, ord('q'))
 
-HUD_H = 30      # height in px of the info strip drawn above the frame
-BOX_COLOR = (0, 200, 255)
-SPEED_STEP = 1.5
-MIN_SPEED = 1.0 / 16
-MAX_SPEED = 16.0
-
-LOS_REF_COLOR = (0, 255, 255)   # the clicked point, at its own frame
-LOS_PRED_COLOR = (0, 0, 255)    # the predicted point, on every other frame
-REANCHOR_EVERY = 500  # re-anchor the LOS reference to the nearest detection this
-                    # often, so attitude/timing drift over a long dead-reckoned
-                    # run gets periodically corrected against a real detection
-                    # instead of compounding for the rest of the file
-LOS_LATENCY_S = -0.070  # world-event -> attitude-lookup shift, applied on top of
-                     # the los-*.csv's own qw..qz. Left at 0: the recording
-                     # pipeline was found to already apply its own --latency-ms
-                     # (200ms on the deployed rig) before writing the csv, so
-                     # correcting again here would double-count it. See
-                     # experiment/los_static_track.py's history for how that
-                     # was found and confirmed.
+# All tunables live in config.py -- see it for why each is set the way it is.
+HUD_H = config.VIEWER_HUD_H
+BOX_COLOR = config.VIEWER_BOX_COLOR
+SPEED_STEP = config.VIEWER_SPEED_STEP
+MIN_SPEED = config.VIEWER_MIN_SPEED
+MAX_SPEED = config.VIEWER_MAX_SPEED
+LOS_TRACK_COLOR = config.VIEWER_LOS_TRACK_COLOR
+LOS_COAST_COLOR = config.VIEWER_LOS_COAST_COLOR
 
 
 def load_detectors():
@@ -112,6 +113,22 @@ def load_filters():
         if hasattr(mod, "filter"):
             filters.append((path.stem, mod.filter))
     return filters
+
+
+def load_initialisers():
+    """Load every init(boxes) function found in the initialisation/ folder."""
+    initialisers = []
+    if not INIT_DIR.is_dir():
+        return initialisers
+    for path in sorted(INIT_DIR.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if hasattr(mod, "init"):
+            initialisers.append((path.stem, mod.init))
+    return initialisers
 
 
 def _load_los_track():
@@ -200,7 +217,7 @@ def main():
     los_path = los_track.find_los_csv(args.file)
     quat_rows = los_track.load_quaternions(los_path) if los_path else []
     los_ts = np.array([r[0] for r in quat_rows]) if quat_rows else None
-    quats = ([los_track.interp_quat(t - LOS_LATENCY_S, quat_rows, los_ts) for _, t in frames]
+    quats = ([los_track.interp_quat(t - config.LOS_LATENCY_S, quat_rows, los_ts) for _, t in frames]
               if (focal and quat_rows) else None)
 
     f = open(args.file, "rb")
@@ -215,12 +232,40 @@ def main():
     det_idx = 0
     annotate = True
 
-    def run_detector(raw_frame):
+    tracker = (los_track.SmoothTracker(quats, [t for _, t in frames], focal, cx, cy, los_track.project)
+               if quats is not None else None)
+    roi_desc = "FULL"
+
+    def run_detector(raw_frame, idx):
+        """Runs the detector full-frame, unless the tracker has a reference
+        (tracking OR coasting) -- then it's cheaper to search only a window
+        around the LOS prediction, sized to safely contain the tracker's own
+        gate. Cropping stays on through a coast: the gate itself grows the
+        longer a fix has been missed (see gate_px), so it's still a search
+        window, not a frozen one, and dropping straight back to a full-frame
+        search on the first missed detection would waste exactly the
+        speedup we want most while something is briefly out of view."""
+        nonlocal roi_desc
         if not annotate:
+            roi_desc = "FULL"
             return []
+        if tracker is not None and tracker.ref is not None:
+            predicted = tracker.point(idx)
+            gate = tracker.gate_px(idx)
+            bounds = (los_track.crop_bounds(predicted[0], predicted[1],
+                                             gate + los_track.CROP_MARGIN_PX, w, h)
+                      if predicted is not None and gate is not None else None)
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                roi_desc = f"{x1 - x0}x{y1 - y0}"
+                crop = raw_frame[y0:y1, x0:x1]
+                boxes = detectors[det_idx][1](crop)
+                return [(x + x0, y + y0, bw, bh, score) for (x, y, bw, bh, score) in boxes]
+        roi_desc = "FULL"
         return detectors[det_idx][1](raw_frame)
 
     filters = load_filters()
+    initialisers = load_initialisers()
 
     frame_idx = 0
     playing = False
@@ -228,53 +273,15 @@ def main():
     last_tick = time.monotonic()
     raw = read_frame(frame_idx)
     disp = to_display(raw, bpp)
-    boxes = run_detector(raw)
-
-    los_ref = None  # {"frame_idx": int, "uv": (x, y)}, or None until clicked
-
-    def current_los_point():
-        """Predicted image position of the clicked point on the current frame."""
-        if los_ref is None or quats is None:
-            return None
-        if frame_idx == los_ref["frame_idx"]:
-            return los_ref["uv"]
-        pred = los_track.project(los_ref["uv"], quats[los_ref["frame_idx"]],
-                                  quats[frame_idx], focal, cx, cy)
-        if pred is None:
-            return None
-        u1, v1 = pred
-        return (u1, v1) if (0 <= u1 < w and 0 <= v1 < h) else None
-
-    def maybe_reanchor_los():
-        """Every REANCHOR_EVERY frames, snap the LOS reference to whichever
-        detection (from the RAW, unfiltered detector output) sits nearest the
-        current prediction -- correcting drift instead of trusting one click
-        for the whole file."""
-        nonlocal los_ref
-        if los_ref is None or quats is None:
-            return
-        if frame_idx - los_ref["frame_idx"] < REANCHOR_EVERY:
-            return
-        predicted = current_los_point()
-        if predicted is None or not boxes:
-            return
-        px, py = predicted
-
-        def center(box):
-            x, y, bw, bh = box
-            return (x + bw / 2.0, y + bh / 2.0)
-
-        nearest = min(boxes, key=lambda b: (center(b)[0] - px) ** 2 + (center(b)[1] - py) ** 2)
-        los_ref = {"frame_idx": frame_idx, "uv": center(nearest)}
+    boxes = run_detector(raw, frame_idx)
 
     mouse = {"x": None, "y": None}
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal los_ref
         mouse["x"], mouse["y"] = x, y - HUD_H
-        if (quats is not None and event == cv2.EVENT_LBUTTONDOWN
+        if (tracker is not None and event == cv2.EVENT_LBUTTONDOWN
                 and 0 <= mouse["x"] < w and 0 <= mouse["y"] < h):
-            los_ref = {"frame_idx": frame_idx, "uv": (mouse["x"], mouse["y"])}
+            tracker.set_click(frame_idx, (mouse["x"], mouse["y"]))
 
     cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(WIN, on_mouse)
@@ -287,8 +294,9 @@ def main():
         frame_idx = idx
         raw = read_frame(frame_idx)
         disp = to_display(raw, bpp)
-        boxes = run_detector(raw)
-        maybe_reanchor_los()
+        boxes = run_detector(raw, frame_idx)
+        if tracker is not None:
+            tracker.update(frame_idx, boxes)
         if total > 1:
             cv2.setTrackbarPos(TRACKBAR, WIN, frame_idx)
 
@@ -309,30 +317,30 @@ def main():
         mx, my = mouse["x"], mouse["y"]
         if mx is not None and 0 <= mx < w and 0 <= my < h:
             text += f"    x={mx} y={my}  val={int(raw[my, mx])}"
-        text += f"    detector={detectors[det_idx][0]} [{'ON' if annotate else 'OFF'}]"
-        if quats is None:
+        text += f"    detector={detectors[det_idx][0]} [{'ON' if annotate else 'OFF'}]  roi={roi_desc}"
+        if tracker is None:
             text += "    los=n/a"
         else:
-            text += "    los=SET" if los_ref else "    los=none (click the target)"
+            text += "    los=SET" if tracker.ref else "    los=none (click the target)"
+            if tracker.ref:
+                text += f" [{tracker.status}]"
         cv2.putText(header, text, (10, HUD_H - 9),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
 
-        los_point = current_los_point()
+        los_point = tracker.point(frame_idx) if tracker is not None else None
 
         view = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
         if annotate:
             draw_boxes = boxes
             for _, fn in filters:
-                draw_boxes = fn(draw_boxes, {"los_point": los_point})
-            for (x, y, bw, bh) in draw_boxes:
+                draw_boxes = fn(draw_boxes, {"los_point": los_point, "frame_w": w, "frame_h": h})
+            for box in draw_boxes:
+                x, y, bw, bh = box[:4]
                 cv2.rectangle(view, (x, y), (x + bw, y + bh), BOX_COLOR, 1)
-        if los_ref is not None:
-            if frame_idx == los_ref["frame_idx"]:
-                cv2.drawMarker(view, tuple(int(v) for v in los_ref["uv"]), LOS_REF_COLOR,
-                                cv2.MARKER_CROSS, 14, 2)
-            elif los_point is not None:
-                cv2.drawMarker(view, (int(los_point[0]), int(los_point[1])), LOS_PRED_COLOR,
-                                cv2.MARKER_CROSS, 14, 2)
+        if los_point is not None:
+            color = LOS_TRACK_COLOR if tracker.status == "tracking" else LOS_COAST_COLOR
+            cv2.drawMarker(view, (int(los_point[0]), int(los_point[1])), color,
+                            cv2.MARKER_CROSS, 14, 2)
         canvas = np.vstack([header, view])
         cv2.imshow(WIN, canvas)
 
@@ -356,10 +364,14 @@ def main():
             goto_frame(frame_idx - 1)
         elif k in DETECTOR_KEYS or c in DETECTOR_KEYS:
             det_idx = (det_idx + 1) % len(detectors)
-            boxes = run_detector(raw)
+            boxes = run_detector(raw, frame_idx)
         elif k in ANNOTATE_KEYS or c in ANNOTATE_KEYS:
             annotate = not annotate
-            boxes = run_detector(raw)
+            boxes = run_detector(raw, frame_idx)
+        elif (k in AUTOINIT_KEYS or c in AUTOINIT_KEYS) and tracker is not None and initialisers:
+            uv = initialisers[0][1](boxes)
+            if uv is not None:
+                tracker.set_click(frame_idx, uv)
 
     f.close()
     cv2.destroyAllWindows()

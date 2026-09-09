@@ -23,21 +23,33 @@ added to the annulus before dividing, so the ratio is capped by roughly
 tophat/NOISE_FLOOR whenever the true background is near zero, keeping noise
 below MIN_SCR while barely denting a real target's score.
 """
+import pathlib
+import sys
+
 import cv2
 import numpy as np
 
-SE_SIZE = 55         # opening kernel, in px -- bigger than the target so the
-                      # opening also erases it, leaving one coherent top-hat blob
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+import config
+
+# All tunables live in config.py -- see it for why each one is set the way
+# it is; nothing here should be edited without editing there.
+SE_SIZE = config.DETECTOR_SE_SIZE
 OUTER_SIZE = 3 * SE_SIZE   # outer box for the background annulus
-MIN_AREA = 9         # px, rejects single-pixel sensor noise
-MAX_AREA = 3000        # px, rejects anything implausibly large
-MIN_SCR = 12.0        # top-hat response over local clutter, the isolation test
-NOISE_FLOOR = 1.0     # DN, floor under the annulus so SCR can't blow up on
-                      # noise where the local background is near zero
+MIN_AREA = config.DETECTOR_MIN_AREA
+MAX_AREA = config.DETECTOR_MAX_AREA
+MIN_SCR = config.DETECTOR_MIN_SCR
+NOISE_FLOOR = config.DETECTOR_NOISE_FLOOR
 
 
 def detect(frame):
-    """Return (x, y, w, h) boxes for candidate targets in a raw sensor frame."""
+    """Return (x, y, w, h, score) boxes for candidate targets in a raw sensor
+    frame. score is the candidate's peak SCR -- already computed for the
+    MIN_SCR gate below, so this just keeps it instead of throwing it away.
+    Consumers that fuse detections with something else (temporal tracking,
+    LOS gating) can use it as a confidence weight."""
     img = frame.astype(np.float32)
 
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (SE_SIZE, SE_SIZE))
@@ -57,5 +69,6 @@ def detect(frame):
     for i in range(1, n):
         x, y, w, h, area = stats[i]
         if MIN_AREA <= area <= MAX_AREA:
-            boxes.append((x, y, w, h))
+            peak_scr = float(scr[y:y + h, x:x + w].max())
+            boxes.append((x, y, w, h, peak_scr))
     return boxes

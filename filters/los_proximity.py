@@ -10,12 +10,16 @@ spot -- since the real target is assumed to be wherever gimbal attitude alone
 predicts a world-static point would be.
 """
 
-MAX_DIST_PX = 150  # how far a detection may sit from the LOS prediction and
-                  # still be kept. Roughly the largest confirmed target
-                  # footprint seen so far in this dataset (~45px), plus slack
-                  # for reprojection error (unverified mount/latency figures,
-                  # SLERP/timestamp join) and the target's own real motion
-                  # away from the static-world assumption.
+import pathlib
+import sys
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+import config
+
+# Tunable lives in config.py -- see it for why it's set the way it is.
+MAX_DIST_PX = config.LOS_PROXIMITY_MAX_DIST_PX
 
 
 def filter(boxes, context):
@@ -24,8 +28,9 @@ def filter(boxes, context):
         return boxes
     lx, ly = los_point
     kept = []
-    for (x, y, w, h) in boxes:
+    for box in boxes:
+        x, y, w, h = box[:4]  # tolerate a trailing confidence score, ignore it here
         bcx, bcy = x + w / 2.0, y + h / 2.0
         if ((bcx - lx) ** 2 + (bcy - ly) ** 2) ** 0.5 <= MAX_DIST_PX:
-            kept.append((x, y, w, h))
+            kept.append(box)
     return kept
