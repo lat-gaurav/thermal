@@ -29,7 +29,7 @@ import numpy as np
 SE_SIZE = 55         # opening kernel, in px -- bigger than the target so the
                       # opening also erases it, leaving one coherent top-hat blob
 OUTER_SIZE = 3 * SE_SIZE   # outer box for the background annulus
-MIN_AREA = 15         # px, rejects single-pixel sensor noise
+MIN_AREA = 9         # px, rejects single-pixel sensor noise
 MAX_AREA = 3000        # px, rejects anything implausibly large
 MIN_SCR = 12.0        # top-hat response over local clutter, the isolation test
 NOISE_FLOOR = 1.0     # DN, floor under the annulus so SCR can't blow up on
