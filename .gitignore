@@ -1,6 +1,9 @@
 # Raw captures: ~43 MB/s, ~155 GB/hour. Never commit these.
 recordings/
 
+# Symlink to external SSD logs folder (/Volumes/PortableSSD/logs) — machine-specific
+logs
+
 # Compiled binary; rebuild with:
 #   gcc -O2 -Wall -Wextra -o bin/record_raw tools/record_raw.c
 bin/record_raw
@@ -9,6 +12,7 @@ tlm_log
 flow_post
 flow_live
 record_sync
-
+logs
+thermal_camera_data
 # Python bytecode
 __pycache__/
