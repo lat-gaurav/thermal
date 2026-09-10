@@ -22,7 +22,7 @@ window to jump straight to a frame number.
 Detectors are loaded from the detector/ folder next to this repo: any .py file
 there exposing a detect(frame) -> [(x, y, w, h), ...] function is picked up
 automatically. Auto-init strategies work the same way from initialisation/:
-any .py file exposing init(boxes) -> (x, y) | None. Only the first one found
+any .py file exposing init(boxes, context) -> (x, y) | None. Only the first
 is used for now (sorted by filename) -- multiple strategies can coexist in
 the folder, picking which one runs isn't wired up yet.
 
@@ -99,6 +99,25 @@ def load_detectors():
     return detectors
 
 
+def pick_initialiser(name=None, initialisers=None):
+    """(name, fn) for one initialiser, chosen BY NAME rather than by sort order.
+
+    Which module acquires the target is a decision, not an accident of what a
+    file is called: dropping a new .py into initialisation/ used to change it
+    silently. Raises rather than guessing if the named one is absent.
+    """
+    initialisers = initialisers if initialisers is not None else load_initialisers()
+    if not initialisers:
+        return None, None
+    if name is None:
+        return initialisers[0]
+    for n, fn in initialisers:
+        if n == name:
+            return n, fn
+    raise KeyError("no initialiser %r in initialisation/ (have: %s)"
+                   % (name, ", ".join(n for n, _ in initialisers)))
+
+
 def load_filters():
     """Load every filter(boxes, context) function found in the filters/ folder."""
     filters = []
@@ -116,7 +135,7 @@ def load_filters():
 
 
 def load_initialisers():
-    """Load every init(boxes) function found in the initialisation/ folder."""
+    """Load every init(boxes, context) function found in initialisation/."""
     initialisers = []
     if not INIT_DIR.is_dir():
         return initialisers
@@ -369,7 +388,8 @@ def main():
             annotate = not annotate
             boxes = run_detector(raw, frame_idx)
         elif (k in AUTOINIT_KEYS or c in AUTOINIT_KEYS) and tracker is not None and initialisers:
-            uv = initialisers[0][1](boxes)
+            uv = pick_initialiser(config.VIEWER_INITIALISER, initialisers)[1](
+                boxes, {"frame_w": w, "frame_h": h})
             if uv is not None:
                 tracker.set_click(frame_idx, uv)
 

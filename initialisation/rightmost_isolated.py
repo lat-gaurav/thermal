@@ -22,8 +22,13 @@ import config
 MIN_ISOLATION_PX = config.INIT_MIN_ISOLATION_PX
 
 
-def init(boxes, min_isolation_px=MIN_ISOLATION_PX):
-    """Return (x, y), or None if no candidate qualifies."""
+def init(boxes, context=None, min_isolation_px=MIN_ISOLATION_PX):
+    """Return (x, y), or None if no candidate qualifies.
+
+    `context` is accepted and ignored: every initialiser takes the same
+    (boxes, context) shape as filters/ do, so a caller does not have to know
+    which one is loaded. This one needs nothing but the boxes.
+    """
     if not boxes:
         return None
     centers = [(x + w / 2.0, y + h / 2.0) for x, y, w, h, *_ in boxes]

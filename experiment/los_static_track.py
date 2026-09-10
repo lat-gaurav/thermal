@@ -257,11 +257,47 @@ class SmoothTracker:
         self.ref = None  # {"frame_idx": int, "uv": (x, y)}
         self.misses = 0
         self.status = "none"  # "none" | "tracking" | "coasting"
+        # Why this frame went the way it did. update() computes all of this to
+        # make its decision and used to throw it away, which made a bad lock
+        # impossible to diagnose after the fact: a flight log that says
+        # "coasting" without saying whether anything was even in the gate, or
+        # how good the thing it fused was, cannot tell you which of the two
+        # failed. Read-only for callers; overwritten every update().
+        self.last = {"score": None, "dist_px": None, "gate_px": None,
+                     "omega_deg_s": None, "alpha": None, "n_in_gate": 0}
+        self.drops = 0            # how many locks have been given up
+        self.last_release = None  # why the most recent one was
 
     def set_click(self, frame_idx, uv):
         self.ref = {"frame_idx": frame_idx, "uv": uv}
         self.misses = 0
         self.status = "tracking"
+        self.drops = getattr(self, "drops", 0)
+
+    def release(self, reason="released"):
+        """Give up the current reference, so the next frame can acquire afresh.
+
+        WITHOUT THIS THE TRACKER IS A ONE-SHOT DEVICE. `ref` was only ever
+        assigned, never cleared, so whatever it latched onto first it held for
+        the life of the process -- coasting on attitude alone forever if the
+        lock broke. `valid` correctly drops to 0 while coasting, so guidance
+        times out and holds, which is safe but terminal: the seeker was done for
+        the rest of the flight even if the target came back into plain view.
+
+        Releasing is deliberately NOT automatic on a long coast. Coasting is the
+        designed behaviour through an occlusion, and a timeout would be a second
+        threshold to guess at. The caller decides, on evidence -- see
+        tools/flight_pipeline.py, which releases when the radar cue and the
+        tracked LOS disagree persistently, i.e. when something other than the
+        tracker says the tracker is wrong.
+        """
+        self.ref = None
+        self.misses = 0
+        self.status = "none"
+        self.drops = getattr(self, "drops", 0) + 1
+        self.last_release = reason
+        self.last = {"score": None, "dist_px": None, "gate_px": None,
+                     "omega_deg_s": None, "alpha": None, "n_in_gate": 0}
 
     def _omega_deg_s(self, i0, i1):
         if self.quats is None or i0 == i1:
@@ -302,6 +338,8 @@ class SmoothTracker:
         predicted = self.point(frame_idx)
         if predicted is None:
             self.status = "coasting"
+            self.last = {"score": None, "dist_px": None, "gate_px": None,
+                         "omega_deg_s": None, "alpha": None, "n_in_gate": 0}
             return  # can't propagate (behind camera / off-frame) -- try again next frame
         px, py = predicted
 
@@ -309,19 +347,23 @@ class SmoothTracker:
         gate = self.gate_px(frame_idx)
         conf_scale = 1.0 / (1.0 + omega / self.OMEGA_REF_DEG_S)
 
-        best, best_cost = None, None
+        best, best_cost, best_score, best_d, n_in_gate = None, None, None, None, 0
         for box in boxes:
             x, y, w, h, score = box
             bx, by = x + w / 2.0, y + h / 2.0
             d = ((bx - px) ** 2 + (by - py) ** 2) ** 0.5
             if d > gate:
                 continue
+            n_in_gate += 1
             eff_conf = max(score * conf_scale, 0.0)
             dist_term = d / gate                                   # in [0, 1]
             conf_term = 1.0 - min(eff_conf / self.CONF_REF, 1.0)   # in [0, 1]
             cost = dist_term + conf_term                            # in [0, 2]
             if best is None or cost < best_cost:
-                best, best_cost = (bx, by), cost
+                best, best_cost, best_score, best_d = (bx, by), cost, score, d
+
+        self.last = {"score": best_score, "dist_px": best_d, "gate_px": gate,
+                     "omega_deg_s": omega, "alpha": None, "n_in_gate": n_in_gate}
 
         if best is None:
             self.ref = {"frame_idx": frame_idx, "uv": (px, py)}
@@ -331,6 +373,7 @@ class SmoothTracker:
 
         match_quality = 1.0 - best_cost / 2.0  # cost in [0, 2] -> quality in [0, 1]
         alpha = min(self.ALPHA_MAX, max(0.0, match_quality) * (1.0 + self.MISS_GAIN * self.misses))
+        self.last["alpha"] = alpha
         blended = (px + alpha * (best[0] - px), py + alpha * (best[1] - py))
         self.ref = {"frame_idx": frame_idx, "uv": blended}
         self.misses = 0

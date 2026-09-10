@@ -21,7 +21,7 @@ assigned in enumeration order and they move. Use the by-id paths below.
 | Gimbal serial telemetry | `/dev/local_dds` (or the FTDI by-id path) | `/dev/ttyUSB0` |
 
 ```bash
-./set_fps_jetson.py --list     # prints the camera's resolved video + serial paths
+./tools/set_fps_jetson.py --list     # prints the camera's resolved video + serial paths
 ./calibration/check_gimbal.py              # prints the gimbal's resolved path and link health
 ```
 

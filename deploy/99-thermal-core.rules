@@ -1,0 +1,25 @@
+# Artosyn "Sirius" thermal core -> /dev/thermal0, for THIS repo's pipeline.
+#
+# WHY THIS REPO SHIPS ITS OWN RULE. The symlink used to come from another
+# project's rule file, which also carried ENV{SYSTEMD_WANTS} for that project's
+# service -- so every time the camera appeared, that service was started, even
+# with it `systemctl disable`d. Disabling something is not enough when udev is
+# what launches it. This repo now provides the symlink itself, so that other
+# file can be masked, edited or deleted without taking /dev/thermal0 with it.
+#
+# DELIBERATELY NO ENV{SYSTEMD_WANTS} HERE. Nothing should start a pipeline as a
+# side effect of a device appearing: deploy/run_live.sh polls for the node and
+# waits, and systemd's Restart=always covers a replug. Device-appears-starts-
+# service is exactly the coupling that made the other service impossible to
+# turn off.
+#
+# MATCHED BY USB SERIAL, NEVER BY KERNEL NAME. videoN numbers drift on
+# re-enumeration -- one debugging session saw 4 -> 6 -> 9 -> 11 -> 4 -> 24
+# (docs/DEVICE_NODES.md). ATTR{index}=="0" is the capture node; index 1 is the
+# UVC metadata node, which opens without error and then never yields a frame,
+# so matching it gives you a pipeline that starts cleanly and shows nothing.
+#
+# REPLACING THE CORE means changing the serial below. It is the one value here
+# that is specific to this physical unit; read the new one from
+#   ls -l /dev/serial/by-id/   or   lsusb -v -d 1d6b:0101 | grep iSerial
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0101", ATTRS{serial}=="ZBBM5DZFMP", ATTR{index}=="0", SYMLINK+="thermal0", TAG+="systemd"

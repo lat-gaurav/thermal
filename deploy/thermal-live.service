@@ -1,0 +1,46 @@
+[Unit]
+# @REPO@ and @USER@ are substituted by deploy/install.sh at install time, so the
+# unit follows the checkout instead of hardcoding one path.
+Description=Thermal detector/filter pipeline on the live core (@REPO@)
+Documentation=file:@REPO@/deploy/README.md
+After=multi-user.target network-online.target
+
+# NO BindsTo=dev-thermal0.device here, deliberately. That would tie this unit to
+# a udev rule owned by something else on this host; deploy/run_live.sh polls the
+# node itself instead, so this unit depends on nothing outside this checkout.
+# Never stop retrying: the core re-enumerates on the USB bus, and a start limit
+# would give up permanently after a few replugs.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+# video: /dev/video* and /dev/fb0 are root:video. dialout: the core's CDC-ACM
+# control port, which run_live.sh uses to set the frame rate.
+SupplementaryGroups=video dialout
+WorkingDirectory=@REPO@
+EnvironmentFile=/etc/default/thermal-live
+
+ExecStart=@REPO@/deploy/run_live.sh
+
+# The wait-for-device and wait-for-free loops inside run_live.sh can each take
+# THERMAL_WAIT_SECS (60 by default), so systemd must not decide the start hung.
+TimeoutStartSec=180
+
+# Restart forever, but slowly. The two ways this exits are "camera is held by
+# something else" and "camera vanished", and both are conditions that clear on
+# their own schedule -- retrying every second just fills the journal.
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+# Deliberately NOT Nice=-10. This pipeline is not real-time: tophat_scr costs
+# ~0.72 s per frame on this Pi 5 against a 40 ms budget at 25 fps (measured
+# 2026-09-09, see deploy/README.md), so it is a monitor, not a flight-critical
+# loop, and it should yield to anything that is.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=thermal-live
+
+[Install]
+WantedBy=multi-user.target

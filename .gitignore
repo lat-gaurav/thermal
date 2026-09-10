@@ -1,5 +1,8 @@
 # Raw captures: ~43 MB/s, ~155 GB/hour. Never commit these.
-recordings/
+# No trailing slash: on this rig `recordings` is a SYMLINK to the external SSD,
+# and `recordings/` does not match a symlink -- so it kept showing up as
+# untracked, dangling, pointing at a mount that is not always there.
+recordings
 
 # Symlink to external SSD logs folder (/Volumes/PortableSSD/logs) — machine-specific
 logs
@@ -16,3 +19,6 @@ logs
 thermal_camera_data
 # Python bytecode
 __pycache__/
+
+# Copies of whatever was in /etc before deploy/install.sh replaced it.
+deploy/backups/

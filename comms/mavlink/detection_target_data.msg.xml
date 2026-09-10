@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+  DETECTION_TARGET_DATA, msgid 42050.  Uplink only: we send it, the Cube never does.
+
+  RECONSTRUCTED from the protocol reference (RPI_COMMS.md section 3), because the
+  firmware repo's own detection_target_data.msg.xml is not on this machine.  Field
+  names, types and order are taken verbatim from that document's field table.
+
+  Provenance note: this file was carried over from a working companion-computer
+  implementation on this same Pi, whose generated dialect has been sending 42050 to
+  this Cube since 2026-08-08.  The only edit was to make the comment block
+  well-formed XML (a literal double hyphen is illegal inside an XML comment, and
+  ElementTree rejects the original outright).
+
+  This must match the firmware's definition or the CRC_EXTRA will differ and the Cube
+  will silently drop every message.  That is a SAFE failure (nothing is mis-decoded,
+  the messages simply do not arrive) but it is still a failure.  Verify against the
+  Cube's LATD dataflash log (DAz / DEl / Det) before relying on it, and replace this
+  file with the real one when you can copy it off the firmware build machine.
+-->
+<mavlink>
+  <messages>
+    <message id="42050" name="DETECTION_TARGET_DATA">
+      <description>Perception-side target detection: camera-frame bearing plus validity, sent by the companion computer to the flight controller.</description>
+      <field type="uint64_t" name="time_usec" units="us">Capture timestamp (companion computer clock).</field>
+      <field type="float" name="bearing_az" units="rad">Camera-frame bearing azimuth. Mount pitch is applied by the firmware from LAT_CAM_PITCH; do not pre-correct it.</field>
+      <field type="float" name="bearing_el" units="rad">Camera-frame bearing elevation.</field>
+      <field type="float" name="los_n">NED-frame LOS unit vector, north component. Used only when frame=1.</field>
+      <field type="float" name="los_e">NED-frame LOS unit vector, east component. Used only when frame=1.</field>
+      <field type="float" name="los_d">NED-frame LOS unit vector, down component. Used only when frame=1.</field>
+      <field type="float" name="confidence">Detection confidence, 0..1.</field>
+      <field type="float" name="size_rad" units="rad">Angular target size / range cue.</field>
+      <field type="uint16_t" name="seq">Sequence number, for gap detection.</field>
+      <field type="uint8_t" name="frame">0=BODY (use bearing_az/bearing_el), 1=NED (use los_n/e/d).</field>
+      <field type="uint8_t" name="valid">1 = real detection this message, 0 = no detection.</field>
+      <field type="uint8_t" name="target_id">Target id; 0 = default/single target.</field>
+    </message>
+  </messages>
+</mavlink>

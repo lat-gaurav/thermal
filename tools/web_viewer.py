@@ -213,7 +213,7 @@ class LiveSource:
 class Session:
     """All server-side mutable state for one open frame source, one process."""
 
-    def __init__(self, path=None, live_device=None, live_width=1280, live_height=1024):
+    def __init__(self, path=None, live_device=None, live_width=None, live_height=None):
         self.live = None
         if path is not None:
             self.meta = rv.read_header(path)
@@ -225,6 +225,8 @@ class Session:
             self.fps = rv.measured_fps(self.frames)
             self._fh = open(path, "rb")
         else:
+            live_width = config.CAMERA_WIDTH if live_width is None else live_width
+            live_height = config.CAMERA_HEIGHT if live_height is None else live_height
             self.live = LiveSource(live_device, live_width, live_height)
             self.w, self.h, self.bpp = live_width, live_height, 1
             self.dtype = np.uint8
@@ -340,7 +342,7 @@ class Session:
                 "los_status": los_status, "roi": self.roi_desc,
             }
 
-        ok, jpg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        ok, jpg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, config.WEB_JPEG_QUALITY])
         return jpg.tobytes(), meta
 
     def pixel_value(self, idx, x, y):
@@ -376,7 +378,8 @@ class Session:
         with self.lock:
             raw = self.read_frame(idx)
             boxes = self.run_detector(raw, idx)
-            uv = self.initialisers[0][1](boxes)
+            uv = rv.pick_initialiser(config.VIEWER_INITIALISER, self.initialisers)[1](
+                boxes, {"frame_w": self.w, "frame_h": self.h})
             if uv is None:
                 return False, "no isolated detection on this frame"
             self.tracker.set_click(idx, uv)
@@ -475,10 +478,13 @@ def main():
                      help="read live frames from a V4L2 camera instead, e.g. /dev/thermal0 "
                           "(mutually exclusive with FILE; the device only allows one reader, "
                           "so stop any service that already holds it first)")
-    ap.add_argument("--width", type=int, default=1280, help="live camera frame width")
-    ap.add_argument("--height", type=int, default=1024, help="live camera frame height")
-    ap.add_argument("--host", default="0.0.0.0", help="bind address (default: all interfaces)")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--width", type=int, default=config.CAMERA_WIDTH,
+                     help="live camera frame width")
+    ap.add_argument("--height", type=int, default=config.CAMERA_HEIGHT,
+                     help="live camera frame height")
+    ap.add_argument("--host", default=config.WEB_HOST,
+                     help="bind address (default: all interfaces)")
+    ap.add_argument("--port", type=int, default=config.WEB_PORT)
     args = ap.parse_args()
 
     if bool(args.file) == bool(args.live):

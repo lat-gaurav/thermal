@@ -77,19 +77,30 @@ WHAT WAS TRIED AND DROPPED, all measured on the same set:
 import argparse
 import sys
 
+import pathlib
+
 import cv2
 import numpy as np
 
-MED_W = 31          # local-background median window
-RING_IN, RING_OUT = 3, 7    # the moat annulus, in pixels
-NMS_W = 5           # a candidate must be the max of this box
-CAND_FLOOR = 6      # contrast below which a peak is not even a candidate
-CROWD_W = 101       # box within which other candidates are counted
-MERGE = 6           # detections closer than this are one object
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+import config
 
-MIN_CONTRAST = 50.0
-MIN_MOAT = 2.0
-MAX_CROWD = 20
+# All of these live in config.py now -- see its section 2 for the provenance.
+# They are the most expensive numbers in this repository: tuned on a training
+# half of 659 hand-labelled targets and scored ONCE on a held-out half. Do not
+# adjust them without re-running --eval.
+MED_W = config.TD_MED_W                  # local-background median window
+RING_IN, RING_OUT = config.TD_RING_IN, config.TD_RING_OUT   # the moat annulus, px
+NMS_W = config.TD_NMS_W                  # a candidate must be the max of this box
+CAND_FLOOR = config.TD_CAND_FLOOR        # contrast below which a peak is not a candidate
+CROWD_W = config.TD_CROWD_W              # box within which other candidates are counted
+MERGE = config.TD_MERGE_PX               # detections closer than this are one object
+
+MIN_CONTRAST = config.TD_MIN_CONTRAST
+MIN_MOAT = config.TD_MIN_MOAT
+MAX_CROWD = config.TD_MAX_CROWD
 
 
 def _ring(r_in, r_out):

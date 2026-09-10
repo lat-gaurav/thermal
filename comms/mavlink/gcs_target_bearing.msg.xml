@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!--
+  GCS_TARGET_BEARING, msgid 42051.  The radar/GCS cue, already rotated into the
+  camera frame by the firmware.  Downlink only: the Cube sends it, we never do.
+
+  RECONSTRUCTED from RPI_COMMS.md section 4.2's field table, because the firmware
+  repo's own gcs_target_bearing.msg.xml is not on this machine either.  Same
+  situation, same remedy, same caveat as detection_target_data.msg.xml beside it.
+
+  THE FIELD SET IS CORROBORATED BY THE DOCUMENTED WIRE SIZE, which is the one
+  independent check available without the firmware file.  RPI_COMMS.md section 4.2
+  states "23 B payload + 12 B framing = 35 B", and these six fields sum to exactly 23:
+      uint64 8 + float 4 + float 4 + float 4 + uint16 2 + uint8 1 = 23
+  They are also declared in descending size order, so MAVLink's size-sorted wire
+  order equals the declaration order here: there is no ambiguity about which
+  permutation of fields the firmware's CRC_EXTRA was computed over.
+
+  IF THE CRC_EXTRA STILL DISAGREES, every incoming 42051 is dropped as an unknown or
+  bad-CRC message.  Safe, but silent, and indistinguishable from "this firmware does
+  not implement 42051".  tools/cube_probe.py step 6 is what tells those two apart: it
+  reports the COMMAND_ACK for the request separately from whether a message arrives,
+  so an ACCEPTED ack with no message points at this file rather than at the Cube.
+-->
+<mavlink>
+  <messages>
+    <message id="42051" name="GCS_TARGET_BEARING">
+      <description>The GCS/radar target cue, expressed as a camera-frame bearing plus slant range, sent by the flight controller to the companion computer on request. A search prior, not a detection: do not feed it back as one.</description>
+      <field type="uint64_t" name="time_usec" units="us">Autopilot time since boot at which this bearing was computed.</field>
+      <field type="float" name="gcs_target_az" units="rad">Cued target azimuth, camera frame.</field>
+      <field type="float" name="gcs_target_el" units="rad">Cued target elevation, camera frame.</field>
+      <field type="float" name="gcs_target_range" units="m">Slant range, vehicle to cued target.</field>
+      <field type="uint16_t" name="gcs_target_age_ms" units="ms">Age of the underlying radar fix at computation time. Always 0..499 when valid=1.</field>
+      <field type="uint8_t" name="gcs_target_valid">1 = usable. 0 = do not use; the four target fields are then all exactly zero.</field>
+    </message>
+  </messages>
+</mavlink>
