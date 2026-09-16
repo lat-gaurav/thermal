@@ -34,6 +34,13 @@
       <field type="uint8_t" name="frame">0=BODY (use bearing_az/bearing_el), 1=NED (use los_n/e/d).</field>
       <field type="uint8_t" name="valid">1 = real detection this message, 0 = no detection.</field>
       <field type="uint8_t" name="target_id">Target id; 0 = default/single target.</field>
+      <extensions/>
+      <!-- ADDED 2026-09-16, RPI_COMMS.md section 11. A MAVLink 2 extension field,
+           excluded from CRC_EXTRA and appended after the base payload, so firmware
+           built against the field list above (without this line) keeps decoding
+           those 41 bytes exactly as before and simply ignores the extra 4 bytes:
+           no coordinated flag-day, no risk of messages silently dropping either way. -->
+      <field type="uint32_t" name="capture_latency_us" units="us">How old bearing_az/bearing_el actually were the instant this message was sent: this detection's own row-dependent capture latency (rolling shutter) plus this frame's detector+tracker processing time. Typically 115000-165000. The attitude to rotate bearing_az/el with is this sender's estimate at (message_receive_time - capture_latency_us), not "now".</field>
     </message>
   </messages>
 </mavlink>

@@ -415,7 +415,8 @@ class CubeLink:
 
     # ---- send ----------------------------------------------------------------
     def send_detection(self, az_rad, el_rad, valid, confidence=1.0,
-                       capture_usec=None, size_rad=0.0, los_ned=None):
+                       capture_usec=None, size_rad=0.0, los_ned=None,
+                       capture_latency_us=0):
         """One DETECTION_TARGET_DATA per detector frame.
 
         SEND valid=0 FRAMES TOO. Silence for 0.5 s (LAT_DET_TIMEOUT_S) makes
@@ -436,6 +437,15 @@ class CubeLink:
         up, and that `frame` must stay 0. Guidance steers on bearing_az/el. This
         is sent for the record, for the Cube-side log to be checkable against,
         and for whenever that path is finished -- not because anything acts on it.
+
+        capture_latency_us: how old bearing_az/el actually were at send time --
+        this detection's own row-dependent capture latency plus this frame's
+        processing time (tools/flight_pipeline.py computes it per detection, see
+        row_capture_latency_s()). A MAVLink 2 EXTENSION field (RPI_COMMS.md
+        section 11): excluded from CRC_EXTRA, appended after the 41-byte base
+        payload, so a Cube build that does not know about it decodes the same
+        message it always has and just ignores the extra 4 bytes -- no
+        coordination with the firmware side required to keep sending this.
         """
         if not self.can_send:
             return False
@@ -456,7 +466,8 @@ class CubeLink:
                                       # the firmware to los_n/e/d -- that path does
                                       # not exist -- and `frame` is ignored anyway.
             1 if valid else 0,        # the field guidance actually reads
-            0)                        # target_id
+            0,                        # target_id
+            int(capture_latency_us))  # EXTENSION FIELD, see docstring above
         self.n_sent += 1
         return True
 

@@ -691,3 +691,98 @@ intrinsics into the `(az, el)` pair this protocol wants — see §3.1 for the `m
   0.011°, log schemas unchanged), `simulator/sitl_runs/run_frame_roundtrip.sh` (the camera↔body pair are
   exact inverses).
 - **Wider context:** `docs/CommsArchitecture.md` covers both links, including the Cube⇄GCS side.
+
+---
+
+## 11. Proposed change: per-message capture latency (for the Cube developer)
+
+**Status: implemented and sending, as of 2026-09-16.** `tools/flight_pipeline.py` now computes and
+sends `capture_latency_us` on every message with a real detection (0 on the no-detection/cue-fallback
+frames, same as the other numeric fields). The firmware side is untouched and does not need to be —
+see "why this is safe" below. This section exists so you know what is now on the wire and can decide
+whether/when to add the read side.
+
+### 11.1 The problem this solves
+
+`bearing_az`/`bearing_el` in `DETECTION_TARGET_DATA` are pure camera-frame geometry — computed straight
+from a pixel, no timing involved. But the *pixel itself* is not as fresh as the message's arrival makes
+it look. We have now measured, directly (not estimated), that this camera has a rolling-shutter-style
+gradient: at the instant a frame finishes landing in the RPi's memory, its **top row's content is ~146 ms
+old** and its **bottom row's content is ~113 ms old**, varying linearly in between by row number. On top
+of that, the detector + tracker take a further ~15-20 ms (varies frame to frame) before a bearing is
+even computed. So the true age of what a given `DETECTION_TARGET_DATA` message is reporting is
+**typically 115-165 ms**, and it is *different for every message*, depending on where in the frame the
+target was and how loaded the Pi was that frame — not a single constant you can bake in on your end.
+
+Today, as far as we can tell from the handler (§3), the firmware has no way to know this per message, so
+presumably whatever attitude it combines this bearing with is "current attitude at receipt", which is
+wrong by however stale that particular message actually was. We already correct for this on our side when
+computing `los_n/e/d` (§3, currently ignored by `frame=1` not being wired up) — but if your body→NED
+conversion for `bearing_az/el` uses attitude at *receipt time* rather than *capture time*, it has the same
+error we used to have, and it will vary message to message rather than being a fixed, callable-out bias.
+
+### 11.2 What's proposed: one new field, as a MAVLink 2 *extension* field
+
+```
+capture_latency_us   uint32_t   microseconds   How old this message's bearing_az/bearing_el actually
+                                                were, at the instant this message was sent: the target
+                                                pixel's own row-latency (rolling shutter) plus this
+                                                frame's detector+tracker processing time. Typically
+                                                115,000-165,000. Use it as: the attitude to rotate
+                                                bearing_az/el with is your own estimate at
+                                                (message_receive_time - capture_latency_us), not "now".
+```
+
+**Why an *extension* field and not just appending it to the base message:** MAVLink 2 extension fields
+(declared after `<extensions/>` in the `.xml`) are explicitly excluded from the `CRC_EXTRA` calculation
+and are appended at the end of the wire payload. That means:
+
+- Your current firmware, unmodified, keeps working exactly as it does today — it decodes the same 41
+  base bytes it always has, and silently ignores the extra 4 bytes on the end. No `CRC_EXTRA` mismatch,
+  no dropped messages, no coordinated flag-day needed.
+- We can start sending it whenever we're ready; you can add support for it whenever you're ready. The two
+  sides are decoupled, which is the whole point of proposing it as an extension rather than a base-field
+  change.
+- If you'd rather it be a base field instead (e.g. for a reason specific to your build), say so — that
+  *does* require both sides to update in lockstep, since it changes `CRC_EXTRA`, and we'd want to
+  schedule that explicitly rather than have it silently start dropping messages.
+
+### 11.3 Current message format, for cross-checking
+
+Our copy of `detection_target_data.msg.xml` (`comms/mavlink/` in this repo) was **reconstructed** from
+§3's field table, not copied from your build machine — please diff it against your actual
+`ardupilot_overlay/mavlink/detection_target_data.msg.xml` (§10) and tell us if anything doesn't match.
+A silent mismatch there means messages are dropped, not misdecoded, so it is easy to miss. Wire order is
+sorted by decreasing field size (standard MAVLink packing), not XML declaration order:
+
+| offset | bytes | field | type |
+|---|---|---|---|
+| 0 | 8 | `time_usec` | uint64_t |
+| 8 | 4 | `bearing_az` | float |
+| 12 | 4 | `bearing_el` | float |
+| 16 | 4 | `los_n` | float |
+| 20 | 4 | `los_e` | float |
+| 24 | 4 | `los_d` | float |
+| 28 | 4 | `confidence` | float |
+| 32 | 4 | `size_rad` | float |
+| 36 | 2 | `seq` | uint16_t |
+| 38 | 1 | `frame` | uint8_t |
+| 39 | 1 | `valid` | uint8_t |
+| 40 | 1 | `target_id` | uint8_t |
+
+41 bytes declared (40 after MAVLink 2 trailing-zero trim, matching §3). The proposed extension field
+would sit at offset 41, 4 bytes, bringing it to 45 declared / 44 B on the wire.
+
+### 11.4 Bandwidth impact
+
+Negligible. At the current 22 Hz (§5): 22 × (52 + 5) = 1254 B/s, ~22% of the 5760 B/s link budget, up
+from 20% today. Nowhere near the saturation neither of us has seen on this link so far.
+
+### 11.5 What we need from you
+
+1. Confirm the field table in §11.3 matches your real `.xml` (this is worth doing regardless of whether
+   this proposal goes anywhere — see §10's provenance note).
+2. Say whether extension-field or base-field is preferred on your end (§11.2) — extension is our
+   recommendation, for the reason given.
+3. If/when you add the read side, this doc's §3 field table and `test_detection_regression.py` (§10) are
+   the places that would need updating to match.

@@ -69,7 +69,7 @@ const G = [
  ["tracker",    ["status","los_x","los_y","gate_px","n_in_gate","det_score","match_dist_px",
                  "alpha","omega_deg_s","misses","drops","last_release"]],
  ["detector",   ["detector","n_boxes","n_kept","initialiser"]],
- ["bearing sent",["az_deg","el_deg","det_valid","seq_sent","body_az_deg","body_el_deg",
+ ["bearing sent",["az_deg","el_deg","det_valid","valid_hold","seq_sent","body_az_deg","body_el_deg",
                  "los_n","los_e","los_d"]],
  ["radar cue",  ["cue_valid","cue_az_deg","cue_el_deg","cue_range_m","cue_age_ms",
                  "cue_u","cue_v","cue_resid_deg","cue_bad_frames","cue_seen"]],
@@ -86,6 +86,7 @@ function cls(k,v){
   if(k==="status") return v==="tracking"?"ok":(v==="dropped"?"bad":"warn");
   if(k==="throttled") return v==="0x0"?"ok":"bad";
   if(k==="dirty") return v?"warn":"ok";
+  if(k==="valid_hold") return v?"warn":"off";   // valid, but dead-reckoned
   if(k==="cue_valid"||k==="det_valid"||k==="algo_armed"||k==="rec_on") return v?"ok":"off";
   if(k==="skipped"||k==="raw_dropped"||k==="drops") return Number(v)>0?"warn":"ok";
   if(k==="cpu_temp_c") return Number(v)>75?"bad":(Number(v)>60?"warn":"ok");

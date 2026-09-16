@@ -252,46 +252,49 @@ MOUNT_R_BC = [
 # ===========================================================================
 # 7. TIMING: pairing a frame with an attitude
 # ===========================================================================
-CUBE_ATTITUDE_LOOKBACK_S = 0.143
+CUBE_ATTITUDE_LOOKBACK_S = 0.1295
 # How far BACK from a frame's stamp to look up attitude. Positive means into the
 # past, the only direction that physically exists on a live feed.
 #
-# DERIVED TERM BY TERM, and every term is measured:
-#
-#   world moves -> first byte on the Pi        115.0 ms   MEASURED on this rig
-#   first byte  -> frame complete               +35.4 ms   README [B]: the bus
-#                                                          transfer itself, 1.31 MB
-#                                                          at ~37 MB/s. Bandwidth,
-#                                                          not a tunable.
-#   = world -> the stamp this code uses         150.4 ms
-#   attitude serialisation, subtracted           -7.6 ms   44 B, 8N1 at 57600
-#   -----------------------------------------------------
-#   lookback                                    142.8 ms  -> 0.143
+# SUPERSEDED THE OLD TERM-BY-TERM DERIVATION (142.8 ms; see git history for
+# that arithmetic) with a DIRECT MEASUREMENT, per row, at frame-complete:
+# 146 ms at the top row, 113 ms at the bottom -- see CAM_ROW_LATENCY_TOP_S /
+# _BOTTOM_S below. This constant is just their frame-centre average,
+# (146 + 113) / 2 = 129.5 ms, kept as the single flat number for the two
+# things that structurally need exactly one attitude sample per frame and
+# have no particular row to prefer: SmoothTracker's own frame-to-frame
+# prediction, and tools/live_track.py's default. Anywhere a specific
+# detection's own row is known -- tools/flight_pipeline.py's final LOS send
+# -- interpolate between the two row constants instead of using this flat one.
 #
 # WHICH STAMP THIS IS MEASURED FROM MATTERS MORE THAN THE ARITHMETIC.
 # flight/camera.py stamps the instant cv2's read() RETURNS: frame complete, in
-# userspace. In this repo's vocabulary that is t_available, NOT t_first_byte,
-# and those are 35.4 ms apart. Stamp at first byte instead and this becomes
-# 107 ms. Anyone who moves the stamp must redo this sum.
+# userspace, after the whole frame -- every row -- has landed. That is what
+# this constant and the two row constants below are all measured against.
 #
-# THE -7.6 ms TERM's sign: the attitude ring stamps a sample when the last byte
-# of its message is parsed, so a sample LABELLED t describes the attitude 7.6 ms
-# earlier. Asking for a label 7.6 ms later than the true world time therefore
-# returns the attitude at the true world time. Only the serialisation is
-# arithmetic; ArduPilot's own queueing delay is not modelled, so treat this as a
-# floor.
-#
-# WAS 200 ms until 2026-09-10, inherited from a companion rig's empirical fit
-# rather than derived. That over-compensated by 57 ms: 1.7 deg at 30 deg/s,
-# which at focal 1516 is 45 px of LOS misplacement -- comparable to
-# TRACKER_BASE_GATE_PX, and biased consistently in the direction of rotation.
-#
-# STILL WORTH CONFIRMING AGAINST DATA. The sensitivity is second order (a
-# constant delay shifts both ends of an inter-frame delta equally), so live
-# behaviour will not reveal a residual error. Record with real rotation, then
-# scan the offset offline.
+# WAS 200 ms until 2026-09-10, a companion rig's empirical fit rather than
+# derived. WAS 142.8 ms (115.0 ms world->first-byte + 35.4 ms bus transfer -
+# 7.6 ms attitude-serialisation offset, all estimated, none measured per row)
+# until superseded by the direct row measurement above on 2026-09-16.
 
-LOS_LATENCY_S = -0.070   # THE OFFLINE PATH ONLY: applied as `t - latency`
+CAM_ROW_LATENCY_TOP_S = 0.146     # MEASURED, not derived: how old the FIRST
+                                  # row's content is, at the instant the whole
+                                  # frame finishes landing in Pi memory (frame-
+                                  # complete -- not when detect() gets to it).
+CAM_ROW_LATENCY_BOTTOM_S = 0.113  # same, for the LAST row. Fresher, because it
+                                  # was the last part of the frame written, so
+                                  # less time has passed since ITS OWN capture
+                                  # by the time the WHOLE frame is available.
+                                  # Confirms, on this rig, the rolling-shutter
+                                  # gradient README.md's "Open questions" could
+                                  # only observe informally on a different one.
+# Assumed LINEAR in row number between these two measured endpoints. Used in
+# tools/flight_pipeline.py to date a SPECIFIC detection by its own row, on top
+# of which the pipeline's own processing time (frame-complete -> about to
+# send) is added -- that total is what the final LOS send and its logged
+# capture timestamp use, in place of the flat CUBE_ATTITUDE_LOOKBACK_S above.
+
+LOS_LATENCY_S = -0.000   # THE OFFLINE PATH ONLY: applied as `t - latency`
                          # against a recorded los-*.csv by
                          # experiment/los_static_track.py and the viewers.
                          # Being negative it looks 70 ms into the FUTURE of the
@@ -303,9 +306,9 @@ LOS_LATENCY_S = -0.070   # THE OFFLINE PATH ONLY: applied as `t - latency`
                          # what makes that failure impossible.
                          # NOTE recordings written by tools/flight_pipeline.py
                          # stamp the .rawrec and the CSV from ONE clock, so
-                         # replaying those wants +0.143 here; older recordings
+                         # replaying those wants +0.1295 here; older recordings
                          # may not.
-LOS_LATENCY_STEP_S = 0.010  # per key press while live-tuning with '[' / ']'
+LOS_LATENCY_STEP_S = 0.005  # per key press while live-tuning with '[' / ']'
 LOS_MIN_LATENCY_S = -0.5
 LOS_MAX_LATENCY_S = 0.5
 
@@ -350,6 +353,30 @@ CUBE_PARAM_TIMEOUT_S = 3.0       # PARAM_VALUE for a parameter read
 CUBE_RX_TIMEOUT_S = 1.0          # reader thread's recv_match timeout
 CUBE_THREAD_JOIN_S = 2.0         # drain the reader before closing the port
 CUBE_CAM_PITCH_PARAM = "LAT_CAM_PITCH"   # read, cross-checked, never applied here
+
+# HOW LONG A COAST STILL COUNTS AS A DETECTION.
+#
+# The tracker reports "coasting" the moment a single frame puts nothing in its
+# gate, and the uplink used to drop valid to 0 on that same frame. Measured on
+# los-20260914-154321: 159 of 204 coast runs were 1-2 frames long -- a blink --
+# yet each one told guidance "I have lost it", and a lock was held with no
+# usable detection on 58% of frames.
+#
+# A coast is not nothing. The predicted LOS is a real detection propagated
+# forward by measured attitude, so for a short interval it is the best fix
+# available and better than declaring blindness. This is how long that stays
+# true: valid holds through a coast for this long, measured from the last frame
+# that actually fused a detection, then goes to 0.
+#
+# 0.5 s is deliberately the same number as the firmware's own LAT_DET_TIMEOUT_S
+# and LAT_TGT_TIMEOUT_S deadmen, so the RPi gives up at the same moment the Cube
+# would have given up on silence -- one timeout to reason about, not three.
+#
+# NOT A CUBE PARAMETER. It shares the LAT_ prefix with the firmware params above
+# but lives entirely on this side of the wire; nothing reads or writes it on the
+# Cube. Raising it trades a longer dead-reckoned fix for a longer window in which
+# guidance steers on a target that may no longer be there.
+LAT_DET_VALID_TIMEOUT = 0.5    # seconds of coasting still sent as valid=1
 
 # ===========================================================================
 # 9. THE RC SWITCHES   (flight/rc_arm.py)
@@ -493,3 +520,35 @@ PREVIEW_SCALE = 0.5        # encode at half resolution. 640x512 is still every
 PREVIEW_JPEG_QUALITY = 70
 PREVIEW_CUE_COLOR = (255, 128, 0)      # where the radar says the target is
 PREVIEW_DROP_COLOR = (0, 0, 255)       # a lock that was just given up
+
+# --- tools/telemetry_viewer.py: replay of a flight's own logged los-*.csv --
+# Draws what the deployed pipeline recorded per frame, alongside an
+# independent LOS reprojection of our own, so the two can be compared.
+TELEMETRY_COL_W = 235        # px per panel column. The panel columnises
+                             # automatically: there are ~70 lines to show and
+                             # they will not fit one column beside a scaled
+                             # frame, and silently clipping the last groups
+                             # (which include the comparison against our own
+                             # reprojection) would defeat the point.
+TELEMETRY_LINE_H = 17        # px, panel text line spacing
+TELEMETRY_FONT_SCALE = 0.42
+TELEMETRY_LOGGED_DROP_COLOR = (0, 0, 255)      # los_status == "dropped"
+TELEMETRY_LOGGED_NONE_COLOR = (140, 140, 140)  # los_status == "none"
+TELEMETRY_CUE_COLOR = (255, 0, 255)            # the Cube's cue, reprojected (cue_u/v)
+TELEMETRY_OURS_COLOR = (255, 255, 0)           # our own independent LOS reprojection
+TELEMETRY_ROI_COLOR = (120, 90, 0)             # the crop the pipeline searched
+
+# --- sot/: single-object tracker, optional, selected on demand with 's' -----
+# Independent of the detector/LOS pipeline entirely: drag a box around
+# anything on any frame and this follows that patch of pixels forward by
+# appearance alone. For a target the detector doesn't pick up, or as a
+# second, independent check on where the LOS reprojection says it went.
+SOT_ALGO = "opencv_csrt"    # chosen BY NAME from sot/ -- same convention as
+                            # FLIGHT_INITIALISER / VIEWER_INITIALISER above.
+TELEMETRY_SOT_MIN_BOX_PX = 4        # a drag smaller than this in either
+                                    # dimension is a stray click, not a
+                                    # selection -- ignored rather than handed
+                                    # to the tracker as a near-zero-area box.
+TELEMETRY_SOT_COLOR = (0, 255, 255)       # box while the tracker reports "found it"
+TELEMETRY_SOT_LOST_COLOR = (0, 0, 255)    # box while it reports it lost the target
+TELEMETRY_SOT_SELECT_COLOR = (255, 255, 255)  # the box being dragged out, live

@@ -92,13 +92,20 @@ CSV_HEADER = [
     # the release path: how long the cue has been disagreeing, and how many
     # locks have been given up so far
     "cue_bad_frames", "drops",
-    # what went on the wire
-    "az_deg", "el_deg", "det_valid", "seq_sent",
+    # what went on the wire. valid_hold separates the two reasons det_valid can
+    # be 1: a detection was fused THIS frame, or the fix is a coast still inside
+    # LAT_DET_VALID_TIMEOUT. Without it a log cannot say how much of the valid
+    # time guidance got was dead-reckoned.
+    "az_deg", "el_deg", "det_valid", "valid_hold", "seq_sent",
     # the final LOS: camera mounting applied in full, then the vehicle attitude.
     # body_az/el are the same direction measured from the airframe's nose, which
     # is what a human reading this log wants; los_n/e/d are the world-frame unit
-    # vector, and are what went out in the message's los_n/e/d fields.
-    "body_az_deg", "body_el_deg", "los_n", "los_e", "los_d",
+    # vector, and are what went out in the message's los_n/e/d fields. Both use
+    # attitude looked up at THIS detection's own capture latency (its row's
+    # measured age, plus however long this frame has spent in the pipeline
+    # since frame-complete) rather than the flat CUBE_ATTITUDE_LOOKBACK_S --
+    # cap_latency_ms is that total, and what the sent time_usec is dated by.
+    "body_az_deg", "body_el_deg", "los_n", "los_e", "los_d", "cap_latency_ms",
     # the cue, and the running comparison against it. cue_resid_deg is the
     # angular separation between the tracked LOS and the cue -- logged, never
     # acted on.
@@ -181,6 +188,18 @@ def write_session_meta(path, args, det_name, init_name, link, extra=None):
         return None
 
 
+def row_capture_latency_s(v, h):
+    """How old, in seconds, the pixel row at height v is at frame-complete.
+
+    CAM_ROW_LATENCY_TOP_S / _BOTTOM_S are a direct measurement of this rig's
+    rolling-shutter gradient, not a derivation; linear interpolation in row
+    number between them is the only part that is assumed rather than measured.
+    """
+    top, bot = config.CAM_ROW_LATENCY_TOP_S, config.CAM_ROW_LATENCY_BOTTOM_S
+    frac = max(0.0, min(1.0, v / max(1, h - 1)))
+    return top + (bot - top) * frac
+
+
 def now_el(t0):
     return time.monotonic() - t0
 
@@ -234,6 +253,12 @@ def main():
     ap.add_argument("--baud", type=int, default=config.CUBE_BAUD)
     ap.add_argument("--focal", type=float, default=config.CAM_FOCAL_PX)
     ap.add_argument("--lookback", type=float, default=config.CUBE_ATTITUDE_LOOKBACK_S)
+    ap.add_argument("--valid-timeout", type=float, default=config.LAT_DET_VALID_TIMEOUT,
+                    metavar="S",
+                    help="seconds of coasting still sent to the Cube as valid=1, "
+                         "measured from the last frame that fused a detection "
+                         "(default %(default)s). 0 restores the old behaviour: "
+                         "valid drops on the first coasted frame.")
     ap.add_argument("--out-csv", help="per-frame log (one row per processed frame)")
     ap.add_argument("--raw-video", metavar="PATH",
                     help="base name for .rawrec episodes; -NN is appended per episode")
@@ -291,6 +316,9 @@ def main():
           % (init_name, "ON (failure case)" if args.cue_fallback else "off"))
     print("  focal       %.0f px   attitude lookback %.0f ms"
           % (args.focal, 1000 * args.lookback))
+    print("  valid hold  %s"
+          % ("OFF: valid=0 on the first coasted frame" if args.valid_timeout <= 0
+             else "%.0f ms of coasting still sent as valid=1" % (1000 * args.valid_timeout)))
 
     # ---- the Cube: attitude down, RC down, detections up, one connection ----
     link = CubeLink(device=args.cube, baud=args.baud, want_send=not args.no_uplink)
@@ -453,6 +481,12 @@ def main():
     total_skipped = 0
     n_cue_disagree = n_cue_sent = 0
     cue_bad_frames = 0
+    # t_mono of the last frame that actually FUSED a detection. The valid-hold
+    # window is measured from here, so it counts real dead-reckoning time rather
+    # than frames, and is unaffected by the processing path skipping frames.
+    # None means "no live fix to hold": before the first lock, and after a drop.
+    t_last_track = None
+    n_valid_hold = 0
     # vcgencmd forks a process, so sample it on the status cadence and cache it
     # for the page rather than running it once per frame.
     throttle_cache = [throttled_word()]
@@ -502,6 +536,10 @@ def main():
                         tracker = los.SmoothTracker(quats, frame_times, args.focal,
                                                     cx, cy, los.project)
                         idx = -1
+                        # The rebuilt tracker holds no fix, so there is nothing
+                        # to coast from. Leaving this set would let the first
+                        # frames of a new episode inherit the last one's hold.
+                        t_last_track = None
                         print("\n[algo] RUNNING  ch%d=%sus" % (algo_arm.chan,
                                                                algo_arm.last_us), flush=True)
                     else:
@@ -542,6 +580,7 @@ def main():
                             "detector": det_name, "initialiser": init_name,
                             "n_boxes": None, "n_kept": None,
                             "az_deg": None, "el_deg": None, "det_valid": False,
+                            "valid_hold": False,
                             "seq_sent": link.n_sent, "body_az_deg": None,
                             "body_el_deg": None, "los_n": None, "los_e": None,
                             "los_d": None,
@@ -675,17 +714,56 @@ def main():
             tl = tracker.last
 
             # ---- uplink ----
-            valid = status == "tracking" and los_point is not None
+            # A COAST IS STILL A FIX, FOR LAT_DET_VALID_TIMEOUT.
+            #
+            # `coasting` means no detection landed in the gate THIS frame, and
+            # dropping valid to 0 on that frame told guidance "lost" for what was
+            # usually a single-frame blink -- 159 of 204 coast runs in
+            # los-20260914-154321 were 1-2 frames. The predicted LOS is a real
+            # detection propagated by measured attitude, so it is worth steering
+            # on for a short while; past the timeout it has been dead-reckoned
+            # too long and valid goes to 0 while the bearing still goes out.
+            #
+            # Measured from the last FUSED frame, not from the start of the
+            # coast run, so a lock that only manages a match every few frames
+            # cannot keep renewing the window without ever seeing the target.
+            valid_hold = False
+            if status == "tracking" and los_point is not None:
+                valid = True
+                t_last_track = t_frame
+            elif (args.valid_timeout > 0 and status == "coasting"
+                  and los_point is not None and t_last_track is not None
+                  and (t_frame - t_last_track) <= args.valid_timeout):
+                valid = True
+                valid_hold = True
+                n_valid_hold += 1
+            else:
+                valid = False
             az_deg = el_deg = ""
             cue_resid_deg = ""
             baz_deg = bel_deg = ""
             los_n = los_e = los_d = ""
+            cap_latency_s = ""
             if los_point is not None:
                 # what the Cube CONSUMES: camera frame, mount pitch left to it
                 az, el = cam.az_el(los_point[0], los_point[1])
                 az_deg, el_deg = math.degrees(az), math.degrees(el)
-                # the FINAL LOS: mount applied in full, then this frame's attitude
-                e_ned = losv.ned(los_point[0], los_point[1], q)
+                # THIS DETECTION's own age: its row's measured capture latency
+                # (the rolling-shutter gradient, CAM_ROW_LATENCY_TOP/BOTTOM_S),
+                # plus however long this frame has spent in the pipeline since
+                # frame-complete (detect() + tracker + everything above this
+                # line). Finer than the flat CUBE_ATTITUDE_LOOKBACK_S the
+                # per-frame q above already used, so re-look-up attitude with
+                # it for the final LOS -- the one output this can actually
+                # improve without touching SmoothTracker's own per-frame math.
+                cap_latency_s = (row_capture_latency_s(los_point[1], H)
+                                 + (time.monotonic() - t_frame))
+                q_send = link.q_at(t_frame - cap_latency_s)
+                if q_send is None:      # attitude history does not reach back
+                    q_send = q          # that far -- fall back to the flat q
+                # the FINAL LOS: mount applied in full, then this detection's
+                # own (row + pipeline latency)-dated attitude
+                e_ned = losv.ned(los_point[0], los_point[1], q_send)
                 los_n, los_e, los_d = (float(e_ned[0]), float(e_ned[1]), float(e_ned[2]))
                 baz, bel = losv.body_az_el(los_point[0], los_point[1])
                 baz_deg, bel_deg = math.degrees(baz), math.degrees(bel)
@@ -730,6 +808,12 @@ def main():
                         # last thing we believed) but valid=0 tells guidance not
                         # to steer on it.
                         valid = False
+                        valid_hold = False
+                        # There is no longer a fix to coast from, so the hold
+                        # must not survive the release: without this the next
+                        # frames would keep claiming valid=1 on a lock the
+                        # pipeline has just decided was wrong.
+                        t_last_track = None
                         status = "dropped"
                 else:
                     # An invalid cue is not evidence that the tracker is wrong.
@@ -737,9 +821,15 @@ def main():
                     # a cue that flickers in and out must not launder a
                     # disagreement away.
                     pass
+                # capture_usec dated by this detection's own total latency, not
+                # the frame's flat t_frame -- decoded but ignored by the
+                # firmware (RPI_COMMS.md 3), so refining it costs nothing and
+                # makes the sender's own logs/replay more honest about when
+                # what it saw was actually true.
                 link.send_detection(az, el, valid=valid, confidence=1.0 if valid else 0.0,
-                                    capture_usec=int(t_frame * 1e6),
-                                    los_ned=(los_n, los_e, los_d))
+                                    capture_usec=int((t_frame - cap_latency_s) * 1e6),
+                                    los_ned=(los_n, los_e, los_d),
+                                    capture_latency_us=int(cap_latency_s * 1e6))
             elif args.cue_fallback and link.cue.valid:
                 # FAILURE CASE ONLY. The detector has produced nothing to track,
                 # so the cue's own bearing goes out instead. valid stays 0: this
@@ -794,7 +884,8 @@ def main():
                     # --- what went on the wire
                     "az_deg": az_deg if az_deg != "" else None,
                     "el_deg": el_deg if el_deg != "" else None,
-                    "det_valid": bool(valid), "seq_sent": link.n_sent,
+                    "det_valid": bool(valid), "valid_hold": bool(valid_hold),
+                    "seq_sent": link.n_sent,
                     "body_az_deg": baz_deg if baz_deg != "" else None,
                     "body_el_deg": bel_deg if bel_deg != "" else None,
                     "los_n": los_n if los_n != "" else None,
@@ -863,12 +954,13 @@ def main():
                     tracker.misses, cue_bad_frames, tracker.drops,
                     "" if az_deg == "" else "%.4f" % az_deg,
                     "" if el_deg == "" else "%.4f" % el_deg,
-                    int(valid), link.n_sent,
+                    int(valid), int(valid_hold), link.n_sent,
                     "" if baz_deg == "" else "%.4f" % baz_deg,
                     "" if bel_deg == "" else "%.4f" % bel_deg,
                     "" if los_n == "" else "%.6f" % los_n,
                     "" if los_e == "" else "%.6f" % los_e,
                     "" if los_d == "" else "%.6f" % los_d,
+                    "" if cap_latency_s == "" else "%.1f" % (1000.0 * cap_latency_s),
                     int(bool(link.cue.valid)),
                     "" if cue_az == "" else "%.4f" % cue_az,
                     "" if cue_el == "" else "%.4f" % cue_el,

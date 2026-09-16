@@ -57,6 +57,7 @@ import config
 DETECTOR_DIR = REPO_ROOT / "detector"
 FILTER_DIR = REPO_ROOT / "filters"
 INIT_DIR = REPO_ROOT / "initialisation"
+SOT_DIR = REPO_ROOT / "sot"
 
 FILE_HDR = 4096            # bytes of file header before the first record
 REC_MAGIC = 0xA5F00DEC     # per-record header magic, little-endian u32
@@ -148,6 +149,42 @@ def load_initialisers():
         if hasattr(mod, "init"):
             initialisers.append((path.stem, mod.init))
     return initialisers
+
+
+def load_sots():
+    """Load every create() factory found in the sot/ folder.
+
+    Each create() returns a fresh tracker object exposing init(frame, bbox) /
+    update(frame) -> (ok, bbox) -- cv2's own Tracker shape, see sot/opencv_csrt.py.
+    A factory rather than a bare function because a single-object tracker is
+    stateful across frames, unlike detect()/filter()/init() above.
+    """
+    sots = []
+    if not SOT_DIR.is_dir():
+        return sots
+    for path in sorted(SOT_DIR.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if hasattr(mod, "create"):
+            sots.append((path.stem, mod.create))
+    return sots
+
+
+def pick_sot(name=None, sots=None):
+    """(name, create_fn) for one SOT backend, chosen BY NAME rather than sort order."""
+    sots = sots if sots is not None else load_sots()
+    if not sots:
+        return None, None
+    if name is None:
+        return sots[0]
+    for n, fn in sots:
+        if n == name:
+            return n, fn
+    raise KeyError("no sot backend %r in sot/ (have: %s)"
+                   % (name, ", ".join(n for n, _ in sots)))
 
 
 def _load_los_track():
