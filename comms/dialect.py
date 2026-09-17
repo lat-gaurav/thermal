@@ -40,26 +40,28 @@ MAV = mavutil.mavlink
 
 
 def check(verbose=False):
-    """(ok, detail) -- is the dialect in use one that carries both messages?
+    """(ok, detail) -- is the dialect in use one that matches comms/mavlink/?
 
     Checked against the bound mavlink module rather than by importing the
     dialect by name, so this reports what THIS process will actually put on the
     wire, including the case where something imported pymavlink first and got
     stock ardupilotmega instead.
+
+    FIELD LISTS, NOT JUST IDS. A dialect generated before a field was added to
+    the XML still has both ids and would pass an id-only check, while the new
+    field silently does not go out -- see gen_dialect.compare(). The comparison
+    itself lives in gen_dialect so there is exactly one definition of "matches",
+    used both by the installer and by the process about to fly.
     """
-    missing = []
-    for name, mid in (("detection_target_data", MAVLINK_MSG_ID_DETECTION_TARGET_DATA),
-                      ("gcs_target_bearing", MAVLINK_MSG_ID_GCS_TARGET_BEARING)):
-        cls = getattr(MAV, "MAVLink_%s_message" % name, None)
-        if cls is None:
-            missing.append("%s (%d) absent" % (name.upper(), mid))
-        elif cls.id != mid:
-            missing.append("%s has id %d, expected %d" % (name.upper(), cls.id, mid))
-    if missing:
-        return False, ("%s; regenerate with:  python3 comms/gen_dialect.py"
-                       % "; ".join(missing))
-    detail = "dialect=%s wire=MAVLink%s 42050+42051 present" % (
-        os.environ.get("MAVLINK_DIALECT"), "2" if os.environ.get("MAVLINK20") == "1" else "1")
+    from . import gen_dialect          # imported here: it must not pull in
+                                       # pymavlink before the env vars above
+    ok, detail = gen_dialect.compare(
+        lambda name: getattr(MAV, "MAVLink_%s_message" % name.lower(), None))
+    if not ok:
+        return False, "%s; regenerate with:  python3 comms/gen_dialect.py" % detail
+    detail = "dialect=%s wire=MAVLink%s %s" % (
+        os.environ.get("MAVLINK_DIALECT"),
+        "2" if os.environ.get("MAVLINK20") == "1" else "1", detail)
     if verbose:
         print("[dialect] " + detail)
     return True, detail

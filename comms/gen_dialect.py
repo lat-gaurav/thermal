@@ -72,8 +72,74 @@ def collect_messages():
     return out, found
 
 
+def expected_messages():
+    """{NAME: (id, crc_extra, [fieldnames])} as comms/mavlink/*.msg.xml defines it.
+
+    Parsed with pymavlink's OWN mavparse, so crc_extra and the field order are
+    computed by the same code mavgen would use rather than reimplemented here:
+    the answer is what a correct build of this XML WOULD contain, not an
+    approximation of it.
+    """
+    import os
+    os.environ.setdefault("MAVLINK20", "1")     # before the generator is imported
+    from pymavlink.generator import mavparse
+    out = {}
+    for path in sorted(MSG_DIR.glob("*.msg.xml")):
+        for m in mavparse.MAVXML(str(path), "2.0").message:
+            out[m.name] = (m.id, m.crc_extra, [f.name for f in m.fields])
+    return out
+
+
+def compare(lookup):
+    """(ok, detail) -- does what `lookup` provides match the XML in every field?
+
+    `lookup` maps a message name to its generated class, or to None. Checking
+    the FIELD LIST and not just the id is the whole point: an id-only check
+    passes a dialect generated before a field was added, and the send then goes
+    out through pymavlink's trailing force_mavlink1 parameter instead of the
+    field -- which is how capture_latency_us silently failed on 2026-09-16.
+    crc_extra is checked too, because it is what the Cube drops messages over.
+    """
+    try:
+        want = expected_messages()
+    except Exception as e:                       # pragma: no cover - broken install
+        return False, f"could not parse {MSG_DIR}: {e}"
+    problems = []
+    for name, mid in sorted(WANT.items(), key=lambda kv: kv[1]):
+        if name not in want:
+            problems.append(f"{name} ({mid}) has no definition in {MSG_DIR}")
+            continue
+        want_id, want_crc, want_fields = want[name]
+        cls = lookup(name)
+        if cls is None:
+            problems.append(f"{name} ({mid}) absent")
+            continue
+        if cls.id != want_id:
+            problems.append(f"{name} has id {cls.id}, expected {want_id}")
+        if cls.crc_extra != want_crc:
+            problems.append(f"{name} has crc_extra {cls.crc_extra}, expected {want_crc}"
+                            " -- the Cube will drop every one of these")
+        have_fields = list(cls.fieldnames)
+        if have_fields != want_fields:
+            lost = [f for f in want_fields if f not in have_fields]
+            extra = [f for f in have_fields if f not in want_fields]
+            bits = []
+            if lost:
+                bits.append("missing " + ", ".join(lost))
+            if extra:
+                bits.append("unexpected " + ", ".join(extra))
+            if not bits:
+                bits.append(f"field order differs: {have_fields} vs {want_fields}")
+            problems.append(f"{name} is STALE -- " + "; ".join(bits))
+    if problems:
+        return False, "; ".join(problems)
+    detail = ", ".join(f"{n}={want[n][0]}({len(want[n][2])} fields)"
+                       for n, _ in sorted(WANT.items(), key=lambda kv: kv[1]))
+    return True, detail
+
+
 def verify():
-    """Import the installed dialect and check both ids are really there.
+    """Import the installed dialect and check it against the XML, field by field.
 
     Imports the generated module directly rather than going through mavutil, so
     the answer is about the dialect itself and not about anything the environment
@@ -83,17 +149,7 @@ def verify():
         mod = __import__(f"pymavlink.dialects.v20.{DIALECT}", fromlist=[DIALECT])
     except ImportError as e:
         return False, f"dialect {DIALECT} is not installed ({e})"
-    missing = []
-    for name, mid in sorted(WANT.items(), key=lambda kv: kv[1]):
-        cls = getattr(mod, f"MAVLink_{name.lower()}_message", None)
-        if cls is None:
-            missing.append(f"{name} ({mid}) absent")
-        elif cls.id != mid:
-            missing.append(f"{name} has id {cls.id}, expected {mid}")
-    if missing:
-        return False, "; ".join(missing)
-    ids = ", ".join(f"{n}={m}" for n, m in sorted(WANT.items(), key=lambda kv: kv[1]))
-    return True, ids
+    return compare(lambda name: getattr(mod, f"MAVLink_{name.lower()}_message", None))
 
 
 def main():

@@ -81,17 +81,39 @@ class TargetCue:
     (RPI_COMMS.md section 2.1).
     """
 
-    def __init__(self):
+    def __init__(self, stale_s=None):
         self.az = self.el = self.rng = None
         self.age_ms = None
         self.t_usec = None
         self.t_recv = None
         self.n_valid = 0
         self.n_invalid = 0
+        self.stale_s = float(config.CUE_STALE_S if stale_s is None else stale_s)
+
+    @property
+    def age_s(self):
+        """Seconds since the last GCS_TARGET_BEARING of any kind, or None."""
+        if self.t_recv is None:
+            return None
+        return time.monotonic() - self.t_recv
 
     @property
     def valid(self):
-        return self.az is not None
+        """A usable cue arrived AND is still arriving.
+
+        THE SECOND HALF IS NOT REDUNDANT. az is cleared when a message arrives
+        saying gcs_target_valid=0 -- but nothing clears it when 42051 stops
+        arriving at all (GCS quiet, radar offline, link down), so without the
+        staleness test the last cue would read valid forever. That is worse
+        than having no cue: the cue is the release authority (CUE_DROP_DEG), so
+        a frozen one eventually drops a perfectly good lock as the target flies
+        away from where the cue last was. Stale therefore reads exactly like
+        absent, which is also what lets the pipeline notice the cue is gone and
+        fall back to CUELESS_INITIALISER.
+        """
+        if self.az is None or self.t_recv is None:
+            return False
+        return (time.monotonic() - self.t_recv) <= self.stale_s
 
     def update(self, msg):
         self.t_recv = time.monotonic()
@@ -112,9 +134,11 @@ class TargetCue:
     def search_window_rad(self, tgt_speed_mps=30.0, base_rad=math.radians(3.0)):
         """Half-width to search around (az, el), widened for cue age and closeness.
 
-        age_ms is bounded to 0..499 whenever valid, because a cue older than
-        LAT_TGT_TIMEOUT_S = 0.5 s reads invalid instead. So this widens the
-        window WITHIN that half second; it never has to cover a minutes-old cue.
+        age_ms is bounded to 0..499 whenever valid: the firmware marks a cue
+        older than LAT_TGT_TIMEOUT_S = 0.5 s invalid, and if it stops sending
+        instead of saying so, CUE_STALE_S does it on this side. So this widens
+        the window WITHIN that half second; it never has to cover a minutes-old
+        cue.
         base_rad is your own radar/mount uncertainty and is not something the
         Cube can tell you.
         """
@@ -467,7 +491,7 @@ class CubeLink:
                                       # not exist -- and `frame` is ignored anyway.
             1 if valid else 0,        # the field guidance actually reads
             0,                        # target_id
-            int(capture_latency_us))  # EXTENSION FIELD, see docstring above
+            capture_latency_us=int(capture_latency_us))  # EXTENSION, see docstring
         self.n_sent += 1
         return True
 
@@ -487,6 +511,7 @@ class CubeLink:
             "cam_pitch_deg": self.cam_pitch_deg,
             "rc": {c: v[0] for c, v in sorted(self.rc.items())},
             "cue_valid": self.cue.valid,
+            "cue_age_s": self.cue.age_s,
             "cue_n": (self.cue.n_valid, self.cue.n_invalid),
             "can_send": self.can_send,
             "n_sent": self.n_sent,

@@ -68,7 +68,7 @@ const G = [
  ["pipeline",   ["frame","fps","det_ms","loop_ms","roi","skipped","grabbed","uptime_s"]],
  ["tracker",    ["status","los_x","los_y","gate_px","n_in_gate","det_score","match_dist_px",
                  "alpha","omega_deg_s","misses","drops","last_release"]],
- ["detector",   ["detector","n_boxes","n_kept","initialiser"]],
+ ["detector",   ["detector","n_boxes","n_kept","initialiser","acq_via","acq_cueless_n"]],
  ["bearing sent",["az_deg","el_deg","det_valid","valid_hold","seq_sent","body_az_deg","body_el_deg",
                  "los_n","los_e","los_d"]],
  ["radar cue",  ["cue_valid","cue_az_deg","cue_el_deg","cue_range_m","cue_age_ms",

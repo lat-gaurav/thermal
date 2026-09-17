@@ -111,6 +111,10 @@ CSV_HEADER = [
     # acted on.
     "cue_valid", "cue_az_deg", "cue_el_deg", "cue_range_m", "cue_age_ms",
     "cue_u", "cue_v", "cue_resid_deg",
+    # which initialiser this lock came from: the configured one (cued) or the
+    # cueless fallback. Empty means no lock. A row with valid=1 and a cueless
+    # acq_via is a guess that guidance was nonetheless told to steer on.
+    "acq_via",
     # link and hardware health, per frame, so a degradation can be located in
     # time rather than inferred afterwards
     "att_hz", "hb_age_ms", "cube_armed", "grabbed", "raw_dropped",
@@ -243,6 +247,20 @@ def main():
     ap.add_argument("--initialiser", default=config.FLIGHT_INITIALISER,
                     help="module from initialisation/ that acquires the target "
                          "(default %(default)s)")
+    ap.add_argument("--cueless-init", default=config.CUELESS_INITIALISER,
+                    metavar="NAME",
+                    help="module from initialisation/ used to acquire while NO cue "
+                         "is arriving at all (default %(default)s). Without it "
+                         "cue_nearest can never return anything and the whole "
+                         "sortie uplinks valid=0. A lock acquired this way is a "
+                         "guess -- see config.CUELESS_INITIALISER for what it costs.")
+    ap.add_argument("--no-cueless-init", dest="cueless_init", action="store_const",
+                    const=None,
+                    help="never acquire without a cue (the pre-2026-09-16 behaviour)")
+    ap.add_argument("--cue-stale", type=float, default=config.CUE_STALE_S,
+                    metavar="S",
+                    help="no GCS_TARGET_BEARING for this long and the cue reads "
+                         "invalid whatever the last one said (default %(default)s)")
     ap.add_argument("--cue-fallback", action="store_true",
                     help="FAILURE CASE ONLY, off by default: when the tracker has no "
                          "lock at all, send the cue's own bearing instead of nothing. "
@@ -293,6 +311,13 @@ def main():
     init_name, init_fn = rv.pick_initialiser(args.initialiser, initialisers)
     if init_fn is None:
         sys.exit("no initialiser found in initialisation/")
+    # Resolved up front, not on the first cueless frame: an unknown name must
+    # fail on the ground, not silently leave acquisition with nothing to call.
+    cueless_name, cueless_fn = None, None
+    if args.cueless_init:
+        cueless_name, cueless_fn = rv.pick_initialiser(args.cueless_init, initialisers)
+        if cueless_fn is None:
+            sys.exit("no initialiser found in initialisation/")
     los = rv._load_los_track()
 
     W, H = args.width, args.height
@@ -314,6 +339,10 @@ def main():
           % (det_name, ",".join(n for n, _ in filters) or "-"))
     print("  acquire on  %s   cue fallback %s"
           % (init_name, "ON (failure case)" if args.cue_fallback else "off"))
+    print("  no cue      %s"
+          % ("acquire with %s after %.1fs of cue silence -- LOCKS ARE GUESSES"
+             % (cueless_name, args.cue_stale) if cueless_fn is not None
+             else "acquire nothing (valid=0 until the cue returns)"))
     print("  focal       %.0f px   attitude lookback %.0f ms"
           % (args.focal, 1000 * args.lookback))
     print("  valid hold  %s"
@@ -322,6 +351,7 @@ def main():
 
     # ---- the Cube: attitude down, RC down, detections up, one connection ----
     link = CubeLink(device=args.cube, baud=args.baud, want_send=not args.no_uplink)
+    link.cue.stale_s = float(args.cue_stale)
     link.start()
     deadline = time.monotonic() + 2.0
     while link.cam_pitch_deg is None and time.monotonic() < deadline:
@@ -487,6 +517,12 @@ def main():
     # None means "no live fix to hold": before the first lock, and after a drop.
     t_last_track = None
     n_valid_hold = 0
+    # acq_src is the CURRENT lock's provenance: which initialiser produced it.
+    # Set on acquisition and cleared whenever there is no lock, so every logged
+    # frame says whether the thing being uplinked came from a cued acquisition
+    # or from a cueless guess.
+    acq_src = ""
+    n_acq_cueless = 0
     # vcgencmd forks a process, so sample it on the status cadence and cache it
     # for the page rather than running it once per frame.
     throttle_cache = [throttled_word()]
@@ -692,13 +728,31 @@ def main():
                 kept = boxes
                 for _, fn in filters:
                     kept = fn(kept, ctx)
-                uv = init_fn(kept, ctx)
+                # WHICH INITIALISER RUNS IS DECIDED PER FRAME, BY THE CUE.
+                # With a cue, acquisition is "which of these blobs is where the
+                # radar says the target is" -- a question with an answer.
+                # Without one, cue_nearest can only ever return None, so the
+                # pipeline would uplink valid=0 for the entire sortie; the
+                # cueless initialiser guesses instead. The guess is recorded as
+                # a guess (acq_via, below) and is NOT privileged once the cue
+                # returns: the release authority then judges it like any other
+                # lock, and drops it if it disagrees.
+                acq_src = ""                     # no lock => no provenance
+                if cue_point is not None:
+                    acq_fn, acq_via = init_fn, init_name
+                else:
+                    acq_fn, acq_via = cueless_fn, cueless_name
+                uv = acq_fn(kept, ctx) if acq_fn is not None else None
                 if uv is not None:
                     tracker.set_click(idx, uv)
-                    print("\n[acq] locked on a detection %s"
+                    acq_src = acq_via
+                    if cue_point is None:
+                        n_acq_cueless += 1
+                    print("\n[acq] locked on a detection %s  [via %s]"
                           % ("%.0f px from the cue" % ((uv[0] - cue_point[0]) ** 2
                                                        + (uv[1] - cue_point[1]) ** 2) ** 0.5
-                             if cue_point else "(no cue)"), flush=True)
+                             if cue_point else "WITH NO CUE -- this lock is a guess",
+                             acq_via), flush=True)
                 n_kept = len(kept)
             else:
                 # The filters run here too. Applying them only at acquisition let
@@ -903,6 +957,8 @@ def main():
                     "cue_bad_frames": cue_bad_frames,
                     "cue_seen": "%d valid / %d invalid" % (link.cue.n_valid,
                                                             link.cue.n_invalid),
+                    "acq_via": acq_src or None,
+                    "acq_cueless_n": n_acq_cueless,
                     # --- link health
                     "sysid": link.sysid, "cube_armed": link.armed,
                     "att_hz": round(link.attitude_hz_measured(), 2),
@@ -969,6 +1025,7 @@ def main():
                     "" if cue_point is None else "%.1f" % cue_point[0],
                     "" if cue_point is None else "%.1f" % cue_point[1],
                     "" if cue_resid_deg == "" else "%.3f" % cue_resid_deg,
+                    acq_src,
                     "%.2f" % link.attitude_hz_measured(),
                     "" if link.t_heartbeat is None
                     else "%.0f" % (1000.0 * (time.monotonic() - link.t_heartbeat)),

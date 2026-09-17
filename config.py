@@ -152,16 +152,37 @@ FLIGHT_INITIALISER = "cue_nearest"         # tools/flight_pipeline.py
 VIEWER_INITIALISER = "rightmost_isolated"  # the offline viewers, which have no
                                            # cue, so the cue-based one could
                                            # never return anything there.
-# There is deliberately NO fallback from cue_nearest to rightmost_isolated in
-# flight. Falling back to it is exactly how a bench scene pointed at a wall
-# produced a confident lock and reported valid=1 on 840 of 841 frames.
+# CUELESS FALLBACK. When no cue is arriving at all, cue_nearest can never
+# return anything and the pipeline sends valid=0 forever -- a sortie with a
+# dead radar link produces no usable detection uplink whatsoever. Set this to
+# an initialisation/ module name to acquire with that one instead, for as long
+# as the cue is absent; None restores the cue-only behaviour.
+#
+# KNOW WHAT THIS COSTS. rightmost_isolated is the strategy flight deliberately
+# moved away from: against ~13 false alarms per frame it locks onto clutter,
+# and a bench scene pointed at a wall produced a confident lock reporting
+# valid=1 on 840 of 841 frames. Worse, with no cue there is also no release
+# authority (CUE_DROP_DEG below is only evaluated while the cue is valid), so
+# nothing can drop that lock until the cue comes back. It is enabled because a
+# wrong bearing the operator can see beats no bearing at all -- but a lock
+# acquired this way is a guess, and the logs mark it as one (acq_via).
+CUELESS_INITIALISER = "rightmost_isolated"  # None = never acquire without a cue
+
+CUE_STALE_S = 0.5        # no GCS_TARGET_BEARING for this long and the cue reads
+                         # invalid, whatever the last one said. Matches the
+                         # firmware's own LAT_TGT_TIMEOUT_S so both sides give up
+                         # together. WITHOUT THIS the cue only goes invalid when a
+                         # message ARRIVES saying so: if 42051 stops entirely the
+                         # last bearing is held forever, and since the cue is the
+                         # release authority, a frozen one drops a good lock as
+                         # the target flies away from where the cue last was.
 
 # --- initialisation/cue_nearest.py -----------------------------------------
 # Acquire the detection nearest where the radar cue says the target is. The cue
 # ACQUIRES and it VALIDATES; it never improves detection and is never fed back
 # as a detection -- guidance already has it first-hand, at full rate, with no
 # round trip, so echoing it would be a feedback loop (RPI_COMMS.md 2.1).
-CUE_ACQUIRE_MAX_PX = 200.0   # a detection this far from the cue's pixel is not
+CUE_ACQUIRE_MAX_PX = 400.0   # a detection this far from the cue's pixel is not
                              # the cued target. Sized from the cue's own error
                              # budget, not the image: at focal 1516 this is
                              # 7.5 deg, covering a 0.5 s-old fix on a 30 m/s

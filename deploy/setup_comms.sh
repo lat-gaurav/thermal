@@ -87,10 +87,12 @@ else
   fail=1
 fi
 if [ "$fail" = 0 ]; then
-  if python3 "$REPO/comms/gen_dialect.py" --verify >/dev/null 2>&1; then
-    ok "dialect thermal_link already carries 42050 + 42051"
+  # Field-by-field against comms/mavlink/*.msg.xml, so a dialect generated
+  # before a field was added is rebuilt rather than passed as "already there".
+  if dialect_detail="$(python3 "$REPO/comms/gen_dialect.py" --verify 2>&1 | sed -E "s/^(ok|FAIL) +//")"; then
+    ok "dialect thermal_link matches comms/mavlink/ (${dialect_detail})"
   elif [ "$CHECK" = 1 ]; then
-    warn "dialect thermal_link is missing or incomplete -- rerun without --check to build it"
+    warn "${dialect_detail} -- rerun without --check to rebuild it"
   else
     echo "  building the dialect from comms/mavlink/*.msg.xml ..."
     python3 "$REPO/comms/gen_dialect.py" 2>&1 | grep -vE '^(Validation skipped|Parsing|Generating|Merged|Found|MAV_BOOL)' | sed 's/^/  /'

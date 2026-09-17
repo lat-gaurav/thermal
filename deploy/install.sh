@@ -128,10 +128,13 @@ ok "THERMAL_MODE=$MODE"
 # broken link discovered on the flight line is worse than a warning here.
 CUBEDEV="$(sed -n 's/^THERMAL_CUBE_DEVICE=//p' "$SRC/thermal-live.env" | tail -1)"; CUBEDEV="${CUBEDEV:-/dev/ttyAMA0}"
 if [ "$MODE" = "track" ]; then comms_bad=bad; else comms_bad=warn; fi
-if python3 "$REPO/comms/gen_dialect.py" --verify >/dev/null 2>&1; then
-  ok "mavlink dialect carries 42050 + 42051"
+# --verify compares the installed dialect to comms/mavlink/*.msg.xml field by
+# field, not just by message id: a dialect built before a field was added still
+# has both ids, and the field it is missing simply never reaches the Cube.
+if dialect_detail="$(python3 "$REPO/comms/gen_dialect.py" --verify 2>&1 | sed -E "s/^(ok|FAIL) +//")"; then
+  ok "mavlink dialect matches comms/mavlink/ (${dialect_detail})"
 else
-  $comms_bad "mavlink dialect is missing 42050/42051 -- run: bash deploy/setup_comms.sh"
+  $comms_bad "${dialect_detail} -- run: bash deploy/setup_comms.sh"
   [ "$MODE" = "track" ] && fail=1
 fi
 if [ -e "$CUBEDEV" ]; then
