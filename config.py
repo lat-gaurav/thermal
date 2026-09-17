@@ -89,7 +89,7 @@ DETECTOR_OUTER_MULTIPLE = 3    # the background annulus is this many times
                                # free of rounding.
 DETECTOR_MIN_AREA = 9          # px, rejects single-pixel sensor noise
 DETECTOR_MAX_AREA = 3000       # px, rejects anything implausibly large
-DETECTOR_MIN_SCR = 12.0        # top-hat response over local clutter: the
+DETECTOR_MIN_SCR = 14.0        # top-hat response over local clutter: the
                                # isolation test, and the detection gate
 DETECTOR_NOISE_FLOOR = 1.0     # DN, floor under the annulus so SCR cannot blow
                                # up on noise where the local background is near
@@ -201,6 +201,26 @@ CUE_VALIDATE_WARN_DEG = 5.0  # warn when the tracked LOS and the cue disagree by
 INIT_MIN_ISOLATION_PX = 100.0  # a candidate counts as isolated if its nearest
                                # neighbour among the frame's other detections is
                                # at least this far away.
+
+# --- initialisation/manual_click.py -----------------------------------------
+# The operator watches http://<pi>:8002/ (flight/preview.py) and clicks the
+# target in the image. The click is a point, not a detection, so this still
+# acquires the nearest real detector candidate to it -- same "acquire BETWEEN
+# candidates the detector already found, never substitute for one" rule as
+# cue_nearest, just sourced from a person instead of the radar.
+MANUAL_CLICK_MAX_PX = 60.0     # a detection this far from the click is not what
+                               # was pointed at. Tighter than CUE_ACQUIRE_MAX_PX:
+                               # a click is a precise, un-aged pixel coordinate,
+                               # not a 0.5 s-old reprojected radar fix, so there
+                               # is no error budget to size this from -- it only
+                               # needs to cover finger/mouse imprecision and the
+                               # preview's own PREVIEW_SCALE rounding.
+MANUAL_CLICK_TIMEOUT_S = 2.0   # how long a click stays armed waiting for a
+                               # matching detection before it is dropped. Long
+                               # enough to survive a frame or two of detector
+                               # noise; short enough that an old click cannot
+                               # cause a surprise lock long after the operator
+                               # moved on to something else.
 
 # ===========================================================================
 # 5. TRACKER   (experiment/los_static_track.py: SmoothTracker)

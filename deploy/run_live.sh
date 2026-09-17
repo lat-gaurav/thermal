@@ -45,6 +45,7 @@ RECORD="${THERMAL_RECORD:-1}"
 RESERVE_MB="${THERMAL_RAW_RESERVE_MB:-2048}"
 ALWAYS_ON="${THERMAL_ALWAYS_ON:-0}"
 DETECTOR="${THERMAL_DETECTOR:-}"
+INITIALISER="${THERMAL_INITIALISER:-}"
 FBDEV="${THERMAL_FBDEV:-/dev/fb0}"
 MAX_FPS="${THERMAL_MAX_FPS:-30}"
 
@@ -203,6 +204,7 @@ case "$MODE" in
     [ "$UPLINK" = "1" ] || ARGS+=(--no-uplink)
     [ "$ALWAYS_ON" = "1" ] && ARGS+=(--always-on)
     [ -n "$DETECTOR" ] && ARGS+=(--detector "$DETECTOR")
+    [ -n "$INITIALISER" ] && ARGS+=(--initialiser "$INITIALISER")
     log "flight pipeline: stamp $S  log_dir $LOG_DIR_USED  record=$RECORD uplink=$UPLINK always_on=$ALWAYS_ON"
     ;;
   *)

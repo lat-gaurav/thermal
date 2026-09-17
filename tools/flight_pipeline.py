@@ -394,6 +394,8 @@ def main():
     preview = None
     if args.preview_port:
         preview = Preview(port=args.preview_port).start()
+        preview.set_options(sorted(detectors), sorted(n for n, _ in initialisers),
+                           [n for n, _ in filters])
         print("  preview     http://0.0.0.0:%d/   (%.0f fps, %.0f%% scale, own thread)"
               % (args.preview_port, preview.max_fps, 100 * preview.scale))
     print("  recording   %s" % (args.raw_video or "OFF (no --raw-video)"))
@@ -537,6 +539,29 @@ def main():
                 continue
             t_loop = time.monotonic()
 
+            # ---- web controls: detector/initialiser hot-swap ----------------
+            # Applied here, once per frame at the top of the loop, rather than
+            # from the HTTP thread that received the request -- detect() and
+            # init_fn() are only ever called from this thread, so this is the
+            # one place a swap can happen without racing a call in progress.
+            if preview is not None:
+                for field, name in preview.pop_swaps().items():
+                    if field == "detector":
+                        if name in detectors:
+                            detect, det_name = detectors[name], name
+                            preview.set_control_msg("detector -> %s" % name)
+                            print("\n[web] detector switched to %s" % name, flush=True)
+                        else:
+                            preview.set_control_msg("unknown detector %r (have: %s)"
+                                                    % (name, ", ".join(sorted(detectors))))
+                    elif field == "initialiser":
+                        try:
+                            init_name, init_fn = rv.pick_initialiser(name, initialisers)
+                            preview.set_control_msg("initialiser -> %s" % name)
+                            print("\n[web] initialiser switched to %s" % name, flush=True)
+                        except KeyError as e:
+                            preview.set_control_msg(str(e))
+
             # ---- RC: two independent switches -------------------------------
             rc_arm_us = rc_rec_us = ""
             if rec_arm is not None and args.raw_video:
@@ -560,8 +585,19 @@ def main():
                 _w, rec_reason = rec_arm.update(link)
                 rc_rec_us = rec_arm.last_us if rec_arm.last_us is not None else ""
             if algo_arm is not None:
-                want_algo, arm_reason = algo_arm.update(link)
+                rc_want, arm_reason = algo_arm.update(link)
                 rc_arm_us = algo_arm.last_us if algo_arm.last_us is not None else ""
+                # The web toggle can only ADD an ON, never force an OFF the RC
+                # switch didn't ask for: OFF stays the default that needs no
+                # evidence, so a stale browser tab can never override a crew
+                # member's own switch. It exists for the case that switch has
+                # nothing to say -- no transmitter on the bench, or the
+                # channel is simply parked off -- and someone at a laptop
+                # needs to arm it anyway.
+                web_want = preview.web_armed() if preview is not None else False
+                want_algo = rc_want or web_want
+                if web_want and not rc_want:
+                    arm_reason = "web"
                 if want_algo != armed:
                     armed = want_algo
                     if armed:
@@ -619,7 +655,7 @@ def main():
                             "valid_hold": False,
                             "seq_sent": link.n_sent, "body_az_deg": None,
                             "body_el_deg": None, "los_n": None, "los_e": None,
-                            "los_d": None,
+                            "los_d": None, "cap_latency_ms": None,
                             "cue_valid": bool(link.cue.valid),
                             "cue_az_deg": (math.degrees(link.cue.az)
                                            if link.cue.valid else None),
@@ -653,6 +689,7 @@ def main():
                             "git_sha": (git_sha or "")[:12], "dirty": git_dirty,
                             "lookback_s": args.lookback, "focal_px": args.focal,
                             "cue_acquire_px": config.CUE_ACQUIRE_MAX_PX,
+                            "manual_click_px": config.MANUAL_CLICK_MAX_PX,
                             "cue_drop_deg": config.CUE_DROP_DEG,
                             "cue_drop_frames": config.CUE_DROP_FRAMES,
                             "min_scr": config.DETECTOR_MIN_SCR,
@@ -720,13 +757,27 @@ def main():
                 cue_rng, cue_age = link.cue.rng, link.cue.age_ms
 
             ctx = {"los_point": None, "frame_w": W, "frame_h": H,
-                   "cue_point": cue_point}
+                   "cue_point": cue_point,
+                   # Only meaningful to initialisation/manual_click.py; every
+                   # other initialiser ignores these two keys. No preview
+                   # running (--preview-port 0) means no operator can click
+                   # anything, so both are simply absent then.
+                   "manual_point": preview.click_point() if preview else None,
+                   "manual_clear": preview.clear_click if preview else None}
+
+            # ---- which filters run this frame -------------------------------
+            # None (no preview) means every loaded filter runs, same as before
+            # this was ever configurable. With a preview, the page's checkboxes
+            # are the live source of truth -- see Preview.filters_enabled().
+            enabled_filters = preview.filters_enabled() if preview is not None else None
 
             # ---- acquire, or advance ----
             los_point = None
             if tracker.ref is None:
                 kept = boxes
-                for _, fn in filters:
+                for name, fn in filters:
+                    if enabled_filters is not None and name not in enabled_filters:
+                        continue
                     kept = fn(kept, ctx)
                 # WHICH INITIALISER RUNS IS DECIDED PER FRAME, BY THE CUE.
                 # With a cue, acquisition is "which of these blobs is where the
@@ -759,7 +810,9 @@ def main():
                 # the tracker fuse raw detector output -- streaks and frame-border
                 # artifacts included -- for the whole rest of the lock.
                 kept = boxes
-                for _, fn in filters:
+                for name, fn in filters:
+                    if enabled_filters is not None and name not in enabled_filters:
+                        continue
                     kept = fn(kept, ctx)
                 tracker.update(idx, kept)
                 n_kept = len(kept)
@@ -945,6 +998,13 @@ def main():
                     "los_n": los_n if los_n != "" else None,
                     "los_e": los_e if los_e != "" else None,
                     "los_d": los_d if los_d != "" else None,
+                    # How stale THIS detection's bearing was, in ms, at the moment
+                    # it went on the wire -- rolling-shutter row latency plus
+                    # however long this frame spent in the pipeline since
+                    # frame-complete. Same number as the CSV's cap_latency_ms and
+                    # the wire's capture_latency_us, just rounded for the page.
+                    "cap_latency_ms": (None if cap_latency_s == ""
+                                      else round(1000.0 * cap_latency_s, 2)),
                     # --- the radar cue, and the running comparison against it
                     "cue_valid": bool(link.cue.valid),
                     "cue_az_deg": cue_az if cue_az != "" else None,
@@ -986,6 +1046,7 @@ def main():
                     # --- the settings in force, so the page is self-describing
                     "lookback_s": args.lookback, "focal_px": args.focal,
                     "cue_acquire_px": config.CUE_ACQUIRE_MAX_PX,
+                    "manual_click_px": config.MANUAL_CLICK_MAX_PX,
                     "cue_drop_deg": config.CUE_DROP_DEG,
                     "cue_drop_frames": config.CUE_DROP_FRAMES,
                     "min_scr": config.DETECTOR_MIN_SCR,

@@ -28,6 +28,31 @@ WHAT IS DRAWN, and why each thing is there:
                     the thing that authorises it
     HUD             the numbers you would otherwise have to read out of the
                     journal: rate, status, cue residual, drops, arm state
+
+MANUAL ACQUISITION. The page also accepts a click on the image: the browser
+posts the click's pixel in the JPEG's own (post-scale) coordinate space to
+/api/click, and click_point() below divides that back by PREVIEW_SCALE so
+every consumer downstream works in the camera's native frame, same as every
+box and the cue point. That point only DOES something if the pipeline is
+running with --initialiser manual_click (initialisation/manual_click.py); with
+any other initialiser loaded, a click is accepted, stored, and simply never
+read by anything -- harmless, not wired to the tracker.
+
+RUNTIME CONTROLS. The page can also arm the algorithm and hot-swap the
+detector/initialiser, over POST /api/control:
+    {"algo": true|false}     ORed with the RC switch in flight_pipeline.py --
+                              see the note there on why this can only ADD an
+                              ON, never force an OFF the RC switch didn't ask
+                              for.
+    {"detector": "<name>"}   queued here, applied by the main loop at the top
+    {"initialiser": "<name>"} of its next frame -- see pop_swaps().
+    {"filter": "<name>", "enabled": true|false}
+                              takes effect on the very next frame -- unlike
+                              the detector/initialiser, a filter chain has no
+                              "call in progress" to race, so this is a plain
+                              toggle, not a queued swap. See filters_enabled().
+GET /api/options lists the valid names for all three (set once at startup via
+set_options(), from whatever tools/flight_pipeline.py actually loaded).
 """
 import json
 import pathlib
@@ -47,39 +72,166 @@ import config
 _INDEX = b"""<!doctype html><html><head><meta charset="utf-8">
 <title>thermal flight</title>
 <style>
- body{background:#0b0b0b;color:#cfc;font-family:ui-monospace,monospace;margin:0;padding:10px}
- #wrap{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start}
- img{max-width:100%;image-rendering:pixelated;display:block;border:1px solid #333}
- #panel{min-width:340px;font-size:13px;line-height:1.5}
- h2{font-size:12px;color:#6f6;margin:10px 0 3px;text-transform:uppercase;letter-spacing:.08em;
-    border-bottom:1px solid #2a2a2a;padding-bottom:2px}
+ /* EVERYTHING FITS IN ONE VIEWPORT, NO PAGE SCROLL: html/body are pinned to
+    100% height with overflow hidden, #wrap fills that exactly, and the two
+    columns size themselves to it. If a very short/narrow window still can't
+    fit both columns' content, #panel and #ctrl scroll INTERNALLY (see their
+    own overflow:auto) rather than the page growing -- clipping data with
+    overflow:hidden there would hide telemetry silently, which is worse than
+    an occasional inner scrollbar. */
+ html,body{height:100%}
+ body{background:#0b0b0b;color:#cfc;font-family:ui-monospace,monospace;margin:0;
+      padding:8px;box-sizing:border-box;overflow:hidden}
+ #wrap{height:calc(100% - 16px);display:flex;gap:10px;align-items:stretch}
+ #left{flex:1 1 56%;min-width:0;display:flex;flex-direction:column;height:100%}
+ #imgbox{flex:1 1 auto;min-height:0;display:flex;align-items:center;justify-content:center;
+        overflow:hidden}
+ #img{max-width:100%;max-height:100%;width:auto;height:auto;display:block;
+     image-rendering:pixelated;border:1px solid #333;cursor:crosshair}
+ #panel{flex:1 1 44%;min-width:280px;height:100%;overflow:auto;font-size:12px;line-height:1.4;
+       columns:2;column-gap:16px}
+ .grp{break-inside:avoid-column;break-inside:avoid}
+ h2{font-size:11px;color:#6f6;margin:6px 0 2px;text-transform:uppercase;letter-spacing:.07em;
+    border-bottom:1px solid #2a2a2a;padding-bottom:1px}
  table{border-collapse:collapse;width:100%}
- td{padding:1px 6px 1px 0;vertical-align:top}
+ td{padding:0 6px 0 0;vertical-align:top}
  td.k{color:#7a8;width:47%}
  td.v{color:#dfd;font-weight:600}
  .ok{color:#5f5}.warn{color:#fc4}.bad{color:#f55}.off{color:#777}
+ #clickmsg{flex:0 0 auto;font-size:11px;color:#7a8;min-height:1.3em;margin:4px 0 0}
+ #ctrl{flex:0 0 auto;overflow:auto;margin-top:6px;padding:6px 8px;border:1px solid #2a2a2a;
+      border-radius:4px}
+ #ctrl label{display:block;font-size:10px;color:#7a8;text-transform:uppercase;
+             letter-spacing:.06em;margin:5px 0 1px}
+ #ctrl label:first-child{margin-top:0}
+ #ctrl select,#ctrl button{width:100%;background:#151515;color:#cfc;border:1px solid #333;
+                           padding:4px 6px;font:inherit;font-size:12px;border-radius:3px;
+                           cursor:pointer}
+ #algoBtn{font-weight:600;letter-spacing:.04em}
+ #algoBtn.on{background:#163016;border-color:#3a6;color:#9f9}
+ #algoBtn.off{background:#301616;border-color:#a55;color:#f99}
+ #filterList{display:flex;flex-wrap:wrap;column-gap:12px;row-gap:1px}
+ #filterList label{display:flex;align-items:center;gap:4px;font-size:12px;color:#dfd;
+                   text-transform:none;letter-spacing:normal;margin:0;font-weight:normal}
+ #filterList input{width:auto;cursor:pointer}
+ #ctrlmsg{font-size:11px;color:#7a8;min-height:1.3em;margin-top:4px}
+ /* Below ~700px tall or ~760px wide, one screen genuinely cannot hold a
+    640x512 image AND ~10 telemetry groups AND the control panel at a
+    legible size -- fall back to a normal scrolling page rather than
+    shrinking everything into unreadability. */
+ @media (max-height:700px),(max-width:760px){
+   body{overflow:auto}
+   #wrap{height:auto;flex-wrap:wrap}
+   #left{height:auto}
+   #imgbox{min-height:240px}
+   #panel{height:auto;columns:1}
+ }
 </style></head><body>
 <div id="wrap">
-  <img id="img" src="/stream.mjpg">
+  <div id="left">
+    <div id="imgbox"><img id="img" src="/stream.mjpg"></div>
+    <div id="clickmsg">click the target to acquire manually (needs --initialiser manual_click)</div>
+    <div id="ctrl">
+      <label>algorithm</label>
+      <button id="algoBtn" onclick="toggleAlgo()">...</button>
+      <label>detector</label>
+      <select id="detSel" onchange="postControl({detector:this.value})"></select>
+      <label>initialiser</label>
+      <select id="initSel" onchange="postControl({initialiser:this.value})"></select>
+      <label>filters</label>
+      <div id="filterList"></div>
+      <div id="ctrlmsg"></div>
+    </div>
+  </div>
   <div id="panel">connecting...</div>
 </div>
 <script>
+// Click-to-acquire: send the click in the JPEG's OWN pixel space (its natural
+// width/height, i.e. already at PREVIEW_SCALE) -- the browser may be
+// stretching or shrinking the displayed <img> to fit the layout, so the click
+// position has to be rescaled from "where on screen" to "which JPEG pixel"
+// before it means anything, and the server maps that back to the camera's
+// native frame from there (see Preview.set_click).
+(function(){
+  const img = document.getElementById("img");
+  const msg = document.getElementById("clickmsg");
+  img.addEventListener("click", async (ev) => {
+    const r = img.getBoundingClientRect();
+    const nx = (ev.clientX - r.left) / r.width;
+    const ny = (ev.clientY - r.top) / r.height;
+    const x = Math.round(nx * (img.naturalWidth || r.width));
+    const y = Math.round(ny * (img.naturalHeight || r.height));
+    try {
+      const resp = await fetch("/api/click", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({x, y}),
+      });
+      msg.textContent = resp.ok
+        ? "acquiring near (" + x + ", " + y + ") ..."
+        : "click rejected: " + (await resp.text());
+    } catch (e) { msg.textContent = "click failed: " + e; }
+    setTimeout(() => { msg.textContent =
+      "click the target to acquire manually (needs --initialiser manual_click)"; },
+      2500);
+  });
+})();
+
+// Runtime controls: algo arm toggle, detector/initialiser hot-swap. All three
+// go through one endpoint, /api/control; the outcome (accepted or an unknown
+// name) comes back later via state().control_msg, not the POST response --
+// the POST only confirms the request was QUEUED, applying it is the main
+// loop's job (see Preview.pop_swaps in flight/preview.py).
+let webArmed = false;   // last state THIS PAGE asked for; toggles independently
+                        // of algo_armed, which is the RC-OR-web result
+async function postControl(body){
+  try{
+    const r = await fetch("/api/control", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    if(!r.ok) document.getElementById("ctrlmsg").textContent = "rejected: "+(await r.text());
+  }catch(e){ document.getElementById("ctrlmsg").textContent = "failed: "+e; }
+}
+function toggleAlgo(){
+  webArmed = !webArmed;
+  postControl({algo: webArmed});
+}
+function toggleFilter(name, on){
+  postControl({filter: name, enabled: on});
+}
+async function loadOptions(){
+  try{
+    const o = await (await fetch("/api/options")).json();
+    for(const [id,list] of [["detSel",o.detectors||[]],["initSel",o.initialisers||[]]]){
+      document.getElementById(id).innerHTML =
+        list.map(n => "<option value=\\""+n+"\\">"+n+"</option>").join("");
+    }
+    // Checkboxes, not a select: any subset of filters can run at once, so
+    // this is independent toggles, not a single choice like the two above.
+    // Starts checked -- every filter is ENABLED by default (see
+    // Preview.set_options) -- and tick() below reconciles it with reality.
+    document.getElementById("filterList").innerHTML = (o.filters||[]).map(n =>
+      "<label><input type=checkbox checked data-filter=\\""+n+"\\" "
+      + "onchange=\\"toggleFilter('"+n+"', this.checked)\\">"+n+"</label>").join("");
+  }catch(e){}
+}
+loadOptions();
+
 const G = [
  ["pipeline",   ["frame","fps","det_ms","loop_ms","roi","skipped","grabbed","uptime_s"]],
  ["tracker",    ["status","los_x","los_y","gate_px","n_in_gate","det_score","match_dist_px",
                  "alpha","omega_deg_s","misses","drops","last_release"]],
  ["detector",   ["detector","n_boxes","n_kept","initialiser","acq_via","acq_cueless_n"]],
- ["bearing sent",["az_deg","el_deg","det_valid","valid_hold","seq_sent","body_az_deg","body_el_deg",
-                 "los_n","los_e","los_d"]],
+ ["bearing sent",["az_deg","el_deg","det_valid","valid_hold","cap_latency_ms","seq_sent",
+                 "body_az_deg","body_el_deg","los_n","los_e","los_d"]],
  ["radar cue",  ["cue_valid","cue_az_deg","cue_el_deg","cue_range_m","cue_age_ms",
                  "cue_u","cue_v","cue_resid_deg","cue_bad_frames","cue_seen"]],
  ["cube link",  ["sysid","cube_armed","att_hz","att_age_ms","hb_age_ms","lat_cam_pitch_deg",
                  "uplink","n_sent"]],
- ["rc switches",["algo_armed","arm_reason","rc_arm_us","rec_armed","rec_reason","rc_rec_us"]],
+ ["rc switches",["algo_armed","algo_web_armed","arm_reason","rc_arm_us",
+                 "rec_armed","rec_reason","rc_rec_us"]],
  ["recording",  ["rec_on","episode","rec_frames","raw_dropped","rec_path","rec_stop_reason"]],
  ["system",     ["cpu_temp_c","throttled","git_sha","dirty"]],
- ["settings",   ["lookback_s","focal_px","cue_acquire_px","cue_drop_deg","cue_drop_frames",
-                 "min_scr","preview_fps"]],
+ ["settings",   ["lookback_s","focal_px","cue_acquire_px","manual_click_px","cue_drop_deg",
+                 "cue_drop_frames","min_scr","preview_fps"]],
 ];
 function cls(k,v){
   if(v===null||v===undefined||v==="") return "off";
@@ -90,6 +242,9 @@ function cls(k,v){
   if(k==="cue_valid"||k==="det_valid"||k==="algo_armed"||k==="rec_on") return v?"ok":"off";
   if(k==="skipped"||k==="raw_dropped"||k==="drops") return Number(v)>0?"warn":"ok";
   if(k==="cpu_temp_c") return Number(v)>75?"bad":(Number(v)>60?"warn":"ok");
+  // config.LAT_DET_VALID_TIMEOUT (500ms) is the point past which the firmware
+  // itself calls a detection stale -- bad at that line, warn at half of it.
+  if(k==="cap_latency_ms") return Number(v)>500?"bad":(Number(v)>250?"warn":"ok");
   return "";
 }
 function fmt(v){
@@ -103,14 +258,41 @@ async function tick(){
     const s = await (await fetch("/api/state")).json();
     let h="";
     for(const [title,keys] of G){
-      h+="<h2>"+title+"</h2><table>";
+      // .grp keeps a group's heading glued to its own table across the
+      // panel's CSS columns -- without it, a column break can split a
+      // heading from the rows it labels.
+      h+="<div class=grp><h2>"+title+"</h2><table>";
       for(const k of keys){
         if(!(k in s)) continue;
         h+="<tr><td class=k>"+k+"</td><td class='v "+cls(k,s[k])+"'>"+fmt(s[k])+"</td></tr>";
       }
-      h+="</table>";
+      h+="</table></div>";
     }
     document.getElementById("panel").innerHTML=h;
+
+    const btn = document.getElementById("algoBtn");
+    webArmed = !!s.algo_web_armed;         // reflect what another tab requested too
+    btn.textContent = "ALGO: " + (s.algo_armed ? "ON" : "OFF")
+      + (webArmed ? "  (web armed)" : "");
+    btn.className = s.algo_armed ? "on" : "off";
+
+    // Keep a select showing what is actually loaded, but never fight someone
+    // mid-click: a user with the dropdown open should not have it reset from
+    // under them by the next 400 ms poll.
+    for(const [id,key] of [["detSel","detector"],["initSel","initialiser"]]){
+      const sel = document.getElementById(id);
+      if(sel && s[key] && sel.value !== s[key] && document.activeElement !== sel)
+        sel.value = s[key];
+    }
+    // Same "don't fight the mouse" rule as the selects above: never re-check a
+    // box the user has focused, so a click and the next poll can't race.
+    if(s.filters_enabled){
+      const on = new Set(s.filters_enabled);
+      for(const cb of document.querySelectorAll("#filterList input")){
+        if(document.activeElement !== cb) cb.checked = on.has(cb.dataset.filter);
+      }
+    }
+    if(s.control_msg) document.getElementById("ctrlmsg").textContent = s.control_msg;
   }catch(e){ document.getElementById("panel").textContent="no data: "+e; }
 }
 tick(); setInterval(tick, 400);
@@ -129,6 +311,12 @@ class Preview:
         self._state = {}              # everything the page shows, latest wins
         self._jpeg = None             # the most recently encoded frame
         self._seq = 0
+        self._click = None            # (x, y, expire_monotonic) in native-frame px
+        self._web_armed = False       # operator's requested algo state, from the page
+        self._swap = {}               # pending {"detector"|"initialiser": name}
+        self._options = {"detectors": [], "initialisers": [], "filters": []}
+        self._filters_enabled = None  # None until set_options() runs = "not known yet"
+        self._control_msg = ""        # last swap/click outcome, shown on the page
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._run = False
@@ -160,10 +348,118 @@ class Preview:
     def state(self):
         with self._lock:
             d = dict(self._state)
+            d["algo_web_armed"] = self._web_armed
+            d["control_msg"] = self._control_msg
+            d["filters_enabled"] = (sorted(self._filters_enabled)
+                                    if self._filters_enabled is not None else None)
         d["preview_fps"] = self.max_fps
         d["preview_encoded"] = self.encoded
         d["preview_dropped"] = self.dropped
         return d
+
+    # ---- manual acquisition (operator clicks the image) ----------------------
+    def set_click(self, x, y):
+        """Record a click, given in the JPEG's OWN pixel space (post-scale).
+
+        Divided back by self.scale here, once, so every consumer -- the
+        manual_click initialiser included -- works in the camera's native
+        frame, same as every detector box and the cue point.
+        """
+        with self._lock:
+            ox = x / self.scale if self.scale else float(x)
+            oy = y / self.scale if self.scale else float(y)
+            self._click = (ox, oy, time.monotonic() + config.MANUAL_CLICK_TIMEOUT_S)
+
+    def click_point(self):
+        """(x, y) of a pending click in native-frame pixels, or None.
+
+        Auto-expires: a click that never landed near a real detection must not
+        silently reappear and cause a surprise lock long after the operator
+        moved on. Does NOT clear itself on a merely unsuccessful match -- the
+        caller (an initialiser) clears it explicitly once it actually acquires,
+        via clear_click(), so a click gets a few frames of detector noise to
+        land in before it expires.
+        """
+        with self._lock:
+            if self._click is None:
+                return None
+            x, y, expire = self._click
+            if time.monotonic() > expire:
+                self._click = None
+                return None
+            return (x, y)
+
+    def clear_click(self):
+        """Consume the pending click so it cannot re-acquire after a later drop."""
+        with self._lock:
+            self._click = None
+
+    # ---- runtime controls (algo arm, detector/initialiser swap, filters) -----
+    def set_options(self, detectors, initialisers, filters=()):
+        """Populate the page's dropdowns/checkboxes. Called once at startup
+        with whatever tools/flight_pipeline.py actually loaded -- never
+        guessed here. Every filter starts ENABLED, matching the pipeline's own
+        behaviour before any of this existed: with no preview running (or
+        before this call), every loaded filter runs."""
+        with self._lock:
+            self._options = {"detectors": list(detectors),
+                             "initialisers": list(initialisers),
+                             "filters": list(filters)}
+            self._filters_enabled = set(filters)
+
+    def options(self):
+        with self._lock:
+            return dict(self._options)
+
+    def filters_enabled(self):
+        """Copy of the set of filter names that should run this frame, or None
+        if set_options() has not been called yet (main loop then applies its
+        own default -- see tools/flight_pipeline.py). A COPY, not the live
+        set, so a toggle arriving on the HTTP thread mid-frame cannot mutate
+        the very set the main loop is in the middle of checking membership
+        against."""
+        with self._lock:
+            return (set(self._filters_enabled)
+                   if self._filters_enabled is not None else None)
+
+    def set_filter_enabled(self, name, on):
+        with self._lock:
+            if self._filters_enabled is None:
+                self._filters_enabled = set()
+            if on:
+                self._filters_enabled.add(name)
+            else:
+                self._filters_enabled.discard(name)
+
+    def web_armed(self):
+        """The operator's last-requested algo state. The caller (flight_
+        pipeline's arm logic) ORs this with the RC switch -- see the note
+        there on why this can only add an ON, never force an OFF."""
+        with self._lock:
+            return self._web_armed
+
+    def set_web_armed(self, on):
+        with self._lock:
+            self._web_armed = bool(on)
+
+    def request_swap(self, field, value):
+        """Queue a detector/initialiser change. Applied by the main loop at
+        the top of its next frame (see tools/flight_pipeline.py) -- never
+        here, so detect()/init_fn() are never reassigned out from under a
+        call to them in progress on that other thread."""
+        with self._lock:
+            self._swap[field] = value
+
+    def pop_swaps(self):
+        """{field: name, ...} pending since the last call, and clears it."""
+        with self._lock:
+            swap, self._swap = self._swap, {}
+            return swap
+
+    def set_control_msg(self, msg):
+        """One-line human-readable outcome of the last swap, for the page."""
+        with self._lock:
+            self._control_msg = msg
 
     # ---- lifecycle ----------------------------------------------------------
     def start(self):
@@ -289,6 +585,15 @@ def _make_handler(preview):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/api/options":
+                body = json.dumps(preview.options()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/frame.jpg":
                 seq, jpg = preview.latest(-1, timeout=5.0)
                 if jpg is None:
@@ -318,6 +623,55 @@ def _make_handler(preview):
                                          + b"\r\n\r\n" + jpg + b"\r\n")
                 except (BrokenPipeError, ConnectionResetError):
                     pass              # a viewer closed the tab; not an error
+                return
+            self.send_error(404)
+
+        def do_POST(self):
+            if self.path == "/api/click":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    x, y = float(body["x"]), float(body["y"])
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    self.send_error(400, "expected JSON {\"x\":..,\"y\":..}")
+                    return
+                preview.set_click(x, y)
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/api/control":
+                # Accepts any subset of {"algo":bool, "detector":name,
+                # "initialiser":name} in one body. Validity of a name is NOT
+                # checked here -- this thread has no access to what actually
+                # loaded -- it is queued and the main loop applies or rejects
+                # it, with the outcome surfacing via state()["control_msg"].
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(body, dict):
+                        raise ValueError("not an object")
+                except (ValueError, json.JSONDecodeError):
+                    self.send_error(400, "expected a JSON object")
+                    return
+                if "algo" in body:
+                    preview.set_web_armed(bool(body["algo"]))
+                if "detector" in body:
+                    preview.request_swap("detector", str(body["detector"]))
+                if "initialiser" in body:
+                    preview.request_swap("initialiser", str(body["initialiser"]))
+                if "filter" in body:
+                    preview.set_filter_enabled(str(body["filter"]),
+                                              bool(body.get("enabled", True)))
+                resp = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
                 return
             self.send_error(404)
 
