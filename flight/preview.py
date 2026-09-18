@@ -230,6 +230,7 @@ const G = [
                  "rec_armed","rec_reason","rc_rec_us"]],
  ["recording",  ["rec_on","episode","rec_frames","raw_dropped","rec_path","rec_stop_reason"]],
  ["system",     ["cpu_temp_c","throttled","git_sha","dirty"]],
+ ["power",      ["in_volt_v","core_amp_a","rail_watt_w"]],
  ["settings",   ["lookback_s","focal_px","cue_acquire_px","manual_click_px","cue_drop_deg",
                  "cue_drop_frames","min_scr","preview_fps"]],
 ];
@@ -242,6 +243,10 @@ function cls(k,v){
   if(k==="cue_valid"||k==="det_valid"||k==="algo_armed"||k==="rec_on") return v?"ok":"off";
   if(k==="skipped"||k==="raw_dropped"||k==="drops") return Number(v)>0?"warn":"ok";
   if(k==="cpu_temp_c") return Number(v)>75?"bad":(Number(v)>60?"warn":"ok");
+  // 4.75 V is the 5V spec floor -- under it a brownout is a question of when.
+  // Between 4.75 and 4.85 there is little headroom left for the droop that
+  // arrives with load. Same lines tools/disk_soak.py checks against.
+  if(k==="in_volt_v") return Number(v)<4.75?"bad":(Number(v)<4.85?"warn":"ok");
   // config.LAT_DET_VALID_TIMEOUT (500ms) is the point past which the firmware
   // itself calls a detection stale -- bad at that line, warn at half of it.
   if(k==="cap_latency_ms") return Number(v)>500?"bad":(Number(v)>250?"warn":"ok");
