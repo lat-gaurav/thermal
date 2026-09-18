@@ -231,6 +231,56 @@ def throttled_word():
         return "?"
 
 
+def pmic_power():
+    """Supply voltage and rail draw from the Pi 5 PMIC.
+
+    One vcgencmd call reports every rail, so this costs the same single fork as
+    throttled_word() and is sampled on the same status cadence. Returns
+    (ext5v_v, vdd_core_a, rail_w), NaN per field for anything the firmware did
+    not report -- which is what a Pi 4, or no vcgencmd at all, looks like.
+
+    rail_w is the sum of V*A over the rails the PMIC senses, and it is NOT the
+    board's wall draw: there is no current sense on the 5V input, so the USB
+    ports and the regulators' own conversion losses are invisible here. Expect
+    it to read a couple of watts under a meter in the supply lead. Treat it as a
+    load trend, not an absolute. The number worth alarming on is the voltage.
+    """
+    nan = float("nan")
+    try:
+        out = subprocess.run(["vcgencmd", "pmic_read_adc"], capture_output=True,
+                             text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return nan, nan, nan
+    amps, volts = {}, {}
+    for line in out.splitlines():
+        # "  VDD_CORE_A current(7)=0.46436000A" -> amps["VDD_CORE"] = 0.46436
+        label, _, value = line.strip().partition("=")
+        if not value or not label.split():
+            continue
+        rail = label.split()[0]
+        try:
+            reading = float(value.rstrip("AV"))
+        except ValueError:
+            continue
+        if rail.endswith("_A"):
+            amps[rail[:-2]] = reading
+        elif rail.endswith("_V"):
+            volts[rail[:-2]] = reading
+    paired = [a * volts[r] for r, a in amps.items() if r in volts]
+    return (volts.get("EXT5V", nan), amps.get("VDD_CORE", nan),
+            sum(paired) if paired else nan)
+
+
+def jnum(x, places):
+    """Round for the page, but send None for a NaN.
+
+    json.dumps happily writes a bare NaN, which the browser's JSON.parse then
+    rejects -- one failed sensor read would otherwise stop the whole page
+    updating rather than blanking a single field.
+    """
+    return None if x != x else round(x, places)
+
+
 def stamp_paths(args):
     """Resolve the episode-0 names. The caller supplies the shared stamp."""
     return args.out_csv, args.raw_video
@@ -528,6 +578,7 @@ def main():
     # vcgencmd forks a process, so sample it on the status cadence and cache it
     # for the page rather than running it once per frame.
     throttle_cache = [throttled_word()]
+    power_cache = [pmic_power()]
     git_sha, git_dirty = git_revision(_ROOT)
     det_ms = loop_ms = 0.0
 
@@ -684,8 +735,11 @@ def main():
                             "raw_dropped": rec.dropped if rec else None,
                             "rec_path": os.path.basename(rec.path) if rec else None,
                             "rec_stop_reason": rec.stop_reason if rec else None,
-                            "cpu_temp_c": round(cpu_temp_c(), 1),
+                            "cpu_temp_c": jnum(cpu_temp_c(), 1),
                             "throttled": throttle_cache[0],
+                            "in_volt_v": jnum(power_cache[0][0], 2),
+                            "core_amp_a": jnum(power_cache[0][1], 3),
+                            "rail_watt_w": jnum(power_cache[0][2], 2),
                             "git_sha": (git_sha or "")[:12], "dirty": git_dirty,
                             "lookback_s": args.lookback, "focal_px": args.focal,
                             "cue_acquire_px": config.CUE_ACQUIRE_MAX_PX,
@@ -1040,8 +1094,11 @@ def main():
                     "rec_path": os.path.basename(rec.path) if rec else None,
                     "rec_stop_reason": rec.stop_reason if rec else None,
                     # --- host
-                    "cpu_temp_c": round(cpu_temp_c(), 1),
+                    "cpu_temp_c": jnum(cpu_temp_c(), 1),
                     "throttled": throttle_cache[0],
+                    "in_volt_v": jnum(power_cache[0][0], 2),
+                    "core_amp_a": jnum(power_cache[0][1], 3),
+                    "rail_watt_w": jnum(power_cache[0][2], 2),
                     "git_sha": (git_sha or "")[:12], "dirty": git_dirty,
                     # --- the settings in force, so the page is self-describing
                     "lookback_s": args.lookback, "focal_px": args.focal,
@@ -1117,6 +1174,7 @@ def main():
                 t_status = now
                 n_proc_at_status, n_valid_at_status = n_proc, n_valid
                 throttle_cache[0] = throttled_word()
+                power_cache[0] = pmic_power()
     finally:
         rec = close_episode(rec)
         for t in closing:
