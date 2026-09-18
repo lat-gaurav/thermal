@@ -145,6 +145,73 @@ def fnum(row, key):
         return None
 
 
+def annotate_from_row(view, row, overlays=True):
+    """Draw everything the pipeline itself logged for one frame onto a BGR
+    image: the CUBE-valid banner, the ROI it searched, the logged LOS marker
+    (coloured by status), and the Cube's cue. Mutates and returns view.
+
+    Shared between this viewer's live loop and tools/rawrec2mp4.py's
+    --telemetry export, so a burned-in video and the interactive viewer never
+    show two different ideas of what one frame's row actually said.
+
+    Deliberately excludes OUR OWN independent LOS reprojection and the SOT
+    tracker: both need per-session interactive state (a click, a dragged
+    box) that a batch export has no equivalent of.
+    """
+    logged = (fnum(row, "los_x"), fnum(row, "los_y"))
+    status = (row or {}).get("los_status", "") or ""
+
+    # What actually went out on the wire this frame: det_valid is the
+    # ONLY field guidance steers on (RPI_COMMS.md section 3), and
+    # valid_hold separates a fresh fusion from a coast still inside
+    # LAT_DET_VALID_TIMEOUT.
+    det_valid = fnum(row, "det_valid")
+    valid_hold = fnum(row, "valid_hold")
+    if det_valid is None:
+        cube_text, cube_colour = "no data", config.TELEMETRY_LOGGED_NONE_COLOR
+    elif det_valid >= 0.5:
+        if valid_hold and valid_hold >= 0.5:
+            cube_text, cube_colour = "VALID (held/coasting)", config.VIEWER_LOS_COAST_COLOR
+        else:
+            cube_text, cube_colour = "VALID (fresh)", config.VIEWER_LOS_TRACK_COLOR
+    else:
+        cube_text, cube_colour = "NOT VALID", config.TELEMETRY_LOGGED_DROP_COLOR
+
+    # Always drawn, never gated: this is status, not an annotation to hide.
+    banner = f"CUBE: {cube_text}"
+    (btw, bth), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    cv2.rectangle(view, (0, 0), (btw + 16, bth + 16), (0, 0, 0), -1)
+    cv2.rectangle(view, (0, 0), (btw + 16, bth + 16), cube_colour, 2)
+    cv2.putText(view, banner, (8, bth + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                cube_colour, 2, cv2.LINE_AA)
+
+    if not overlays:
+        return view
+
+    # the crop the pipeline searched, centred on its own LOS -- only the size
+    # is logged, not the origin, so the centre is inferred
+    roi = (row or {}).get("roi", "")
+    if roi and roi != "FULL" and "x" in roi and None not in logged:
+        try:
+            rw, rh = (int(v) for v in roi.split("x"))
+            x0, y0 = int(logged[0] - rw / 2), int(logged[1] - rh / 2)
+            cv2.rectangle(view, (x0, y0), (x0 + rw, y0 + rh),
+                           config.TELEMETRY_ROI_COLOR, 1)
+        except ValueError:
+            pass
+
+    if None not in logged:
+        colour = STATUS_COLORS.get(status, config.TELEMETRY_LOGGED_NONE_COLOR)
+        cv2.drawMarker(view, (int(logged[0]), int(logged[1])), colour,
+                        cv2.MARKER_SQUARE, 18, 2)
+
+    cue = (fnum(row, "cue_u"), fnum(row, "cue_v"))
+    if fnum(row, "cue_valid") and None not in cue:
+        cv2.drawMarker(view, (int(cue[0]), int(cue[1])),
+                        config.TELEMETRY_CUE_COLOR, cv2.MARKER_TILTED_CROSS, 18, 2)
+    return view
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -313,34 +380,12 @@ def main():
 
         row = per_frame[frame_idx]
         view = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
+        view = annotate_from_row(view, row, overlays=overlays)
 
         logged = (fnum(row, "los_x"), fnum(row, "los_y"))
-        status = (row or {}).get("los_status", "") or ""
         pred = our_point(frame_idx)
 
         if overlays:
-            # the crop the pipeline searched, centred on its own LOS -- only
-            # the size is logged, not the origin, so the centre is inferred
-            roi = (row or {}).get("roi", "")
-            if roi and roi != "FULL" and "x" in roi and None not in logged:
-                try:
-                    rw, rh = (int(v) for v in roi.split("x"))
-                    x0, y0 = int(logged[0] - rw / 2), int(logged[1] - rh / 2)
-                    cv2.rectangle(view, (x0, y0), (x0 + rw, y0 + rh),
-                                   config.TELEMETRY_ROI_COLOR, 1)
-                except ValueError:
-                    pass
-
-            if None not in logged:
-                colour = STATUS_COLORS.get(status, config.TELEMETRY_LOGGED_NONE_COLOR)
-                cv2.drawMarker(view, (int(logged[0]), int(logged[1])), colour,
-                                cv2.MARKER_SQUARE, 18, 2)
-
-            cue = (fnum(row, "cue_u"), fnum(row, "cue_v"))
-            if fnum(row, "cue_valid") and None not in cue:
-                cv2.drawMarker(view, (int(cue[0]), int(cue[1])),
-                                config.TELEMETRY_CUE_COLOR, cv2.MARKER_TILTED_CROSS, 18, 2)
-
             if pred is not None and 0 <= pred[0] < w and 0 <= pred[1] < h:
                 cv2.drawMarker(view, (int(pred[0]), int(pred[1])),
                                 config.TELEMETRY_OURS_COLOR, cv2.MARKER_CROSS, 16, 2)
@@ -365,15 +410,16 @@ def main():
                                interpolation=cv2.INTER_AREA)
 
         # ---- panel ----------------------------------------------------------
-        lines = []  # (text, colour, indent)
+        lines = []  # (text, colour, indent, swatch)
 
-        def line(text, colour=(0, 255, 0), indent=0):
-            lines.append((text, colour, indent))
+        def line(text, colour=(0, 255, 0), indent=0, swatch=False):
+            lines.append((text, colour, indent, swatch))
 
         line(f"frame {frame_idx + 1}/{total}")
         line(f"t={frame_times[frame_idx]:.3f}")
         line(f"{'PLAY' if playing else 'PAUSE'} {speed:.2g}x "
              f"{'ovl' if overlays else 'no-ovl'}")
+        line(f"CUBE: {cube_text}", cube_colour)
         if sot["armed"]:
             line("SOT: drag a box on the frame to start tracking", (0, 255, 255))
         mx, my = mouse["x"], mouse["y"]
@@ -426,6 +472,34 @@ def main():
                      (0, 255, 0) if ok else (0, 0, 255), indent=4)
                 line(f"{'box':<15s}{bx:.0f},{by:.0f} {bw:.0f}x{bh:.0f}", indent=4)
 
+        # ---- legend: every colour used anywhere above, in one place --------
+        # The same four colours mean the same thing whether they are drawn on
+        # the logged-LOS marker or the CUBE banner -- tracker status and
+        # uplink validity happen to share this palette, not a coincidence
+        # worth two separate legends for.
+        line("")
+        line("-- legend --------------", (0, 180, 255))
+        line("logged LOS tracking / CUBE valid-fresh",
+             config.VIEWER_LOS_TRACK_COLOR, indent=4, swatch=True)
+        line("logged LOS coasting / CUBE valid-held",
+             config.VIEWER_LOS_COAST_COLOR, indent=4, swatch=True)
+        line("logged LOS dropped / CUBE not-valid",
+             config.TELEMETRY_LOGGED_DROP_COLOR, indent=4, swatch=True)
+        line("logged LOS none / no data",
+             config.TELEMETRY_LOGGED_NONE_COLOR, indent=4, swatch=True)
+        line("Cube's radar cue (x marker)",
+             config.TELEMETRY_CUE_COLOR, indent=4, swatch=True)
+        line("our own LOS reprojection (+ marker)",
+             config.TELEMETRY_OURS_COLOR, indent=4, swatch=True)
+        line("search crop the pipeline used (box)",
+             config.TELEMETRY_ROI_COLOR, indent=4, swatch=True)
+        line("SOT tracking (box)",
+             config.TELEMETRY_SOT_COLOR, indent=4, swatch=True)
+        line("SOT lost the target (box)",
+             config.TELEMETRY_SOT_LOST_COLOR, indent=4, swatch=True)
+        line("SOT: dragging a new selection (box)",
+             config.TELEMETRY_SOT_SELECT_COLOR, indent=4, swatch=True)
+
         # Columnise so nothing is clipped: enough columns that the tallest
         # one fits beside the frame, then grow the canvas if even that fails.
         lh = config.TELEMETRY_LINE_H
@@ -434,10 +508,15 @@ def main():
         per_col = -(-len(lines) // ncols)                       # ceil division
         panel_h = max(view.shape[0], per_col * lh + lh)
         panel = np.zeros((panel_h, ncols * config.TELEMETRY_COL_W, 3), dtype=np.uint8)
-        for i, (text, colour, indent) in enumerate(lines):
+        for i, (text, colour, indent, swatch) in enumerate(lines):
             col, rowi = divmod(i, per_col)
-            cv2.putText(panel, text,
-                        (8 + indent + col * config.TELEMETRY_COL_W, (rowi + 1) * lh),
+            x = 8 + indent + col * config.TELEMETRY_COL_W
+            y = (rowi + 1) * lh
+            if swatch:
+                s = lh - 6  # a small filled square in the line's own colour,
+                cv2.rectangle(panel, (x, y - s), (x + s, y), colour, -1)
+                x += s + 6  # then the label starts after it, not on top of it
+            cv2.putText(panel, text, (x, y),
                         cv2.FONT_HERSHEY_SIMPLEX, config.TELEMETRY_FONT_SCALE,
                         colour, 1, cv2.LINE_AA)
 

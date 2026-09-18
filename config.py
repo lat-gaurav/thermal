@@ -493,6 +493,13 @@ FLIGHT_IDLE_SLEEP_S = 0.002    # main-loop sleep when no new frame has arrived
 # 12. VIEWERS AND TOOLS
 # ===========================================================================
 # --- shared UI: tools/rawrec_viewer.py, tools/web_viewer.py ----------------
+VIEWER_INDEX_PROGRESS_INTERVAL_S = 1.0  # rawrec_viewer.build_index(): how often
+                                        # to print a progress line while
+                                        # scanning a file with no cached index
+                                        # yet. A multi-GB capture over a slow
+                                        # link (an external drive under load)
+                                        # can take minutes; without this it is
+                                        # indistinguishable from hung.
 VIEWER_HUD_H = 30       # height in px of the info strip drawn above the frame
 VIEWER_BOX_COLOR = (0, 200, 255)
 VIEWER_LOS_TRACK_COLOR = (0, 255, 0)     # tracker fused a detection this frame

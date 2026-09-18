@@ -209,12 +209,74 @@ def read_header(path):
     return meta
 
 
+_INDEX_CACHE_MAGIC = b"RRIDX01\x00"  # 8 bytes
+
+
+def _index_cache_path(path):
+    return pathlib.Path(str(path) + ".idx")
+
+
+def _load_index_cache(idx_path, size, mtime_ns):
+    """The cached (offset, t_mono) list, or None if absent/stale/unreadable.
+
+    Keyed on the SOURCE file's exact size and mtime, not its name or a
+    checksum: a checksum would mean reading the multi-GB file to validate the
+    cache for it, which defeats the point, and size+mtime already catches the
+    case this exists to prevent -- a still-growing recording, or one replaced
+    at the same path -- since either changes at least one of them.
+    """
+    try:
+        with open(idx_path, "rb") as f:
+            if f.read(len(_INDEX_CACHE_MAGIC)) != _INDEX_CACHE_MAGIC:
+                return None
+            cached_size, cached_mtime, count = struct.unpack("<qqq", f.read(24))
+            if cached_size != size or cached_mtime != mtime_ns:
+                return None
+            offsets = np.fromfile(f, dtype="<i8", count=count)
+            t_monos = np.fromfile(f, dtype="<f8", count=count)
+        if len(offsets) != count or len(t_monos) != count:
+            return None
+        return list(zip(offsets.tolist(), t_monos.tolist()))
+    except (OSError, struct.error, ValueError):
+        return None
+
+
+def _save_index_cache(idx_path, size, mtime_ns, frames):
+    """Best-effort: a viewer must never fail to open a file over this."""
+    try:
+        offsets = np.array([o for o, _ in frames], dtype="<i8")
+        t_monos = np.array([t for _, t in frames], dtype="<f8")
+        with open(idx_path, "wb") as f:
+            f.write(_INDEX_CACHE_MAGIC)
+            f.write(struct.pack("<qqq", size, mtime_ns, len(frames)))
+            offsets.tofile(f)
+            t_monos.tofile(f)
+    except OSError as e:
+        print(f"[index] could not write cache {idx_path}: {e}")
+
+
 def build_index(path, meta):
-    """(offset, t_mono) of every real frame, skipping zero-filled tail padding."""
+    """(offset, t_mono) of every real frame, skipping zero-filled tail padding.
+
+    Cached in a "<path>.idx" sidecar next to the recording: indexing a
+    multi-GB capture over a slow link (an external drive under load, say) can
+    take minutes, and paying that again every time the SAME file is reopened
+    -- which is the common case, re-tuning latency or scrubbing the same
+    flight -- serves no purpose. A progress line covers the one time it does
+    have to be paid, so a long scan is visibly working rather than looking
+    hung.
+    """
     fb, rl = meta["frame_bytes"], meta["rec_len"]
     rechdr = rl - fb
-    total = (os.path.getsize(path) - FILE_HDR) // rl
+    st = os.stat(path)
+    idx_path = _index_cache_path(path)
+    cached = _load_index_cache(idx_path, st.st_size, st.st_mtime_ns)
+    if cached is not None:
+        return cached
+
+    total = (st.st_size - FILE_HDR) // rl
     frames = []
+    t_status = time.time()
     with open(path, "rb") as f:
         for i in range(total):
             off = FILE_HDR + i * rl
@@ -226,8 +288,16 @@ def build_index(path, meta):
             if magic == REC_MAGIC:
                 t_mono, = struct.unpack_from("<d", hb, 12)
                 frames.append((off + rechdr, t_mono))
+            now = time.time()
+            if now - t_status >= config.VIEWER_INDEX_PROGRESS_INTERVAL_S:
+                print(f"\r[index] {path}: {i + 1}/{total} records...",
+                      end="", flush=True)
+                t_status = now
+    if frames:
+        print()  # end the progress line, if one was ever printed
     if not frames:
         sys.exit(f"{path}: no valid frames found")
+    _save_index_cache(idx_path, st.st_size, st.st_mtime_ns, frames)
     return frames
 
 
