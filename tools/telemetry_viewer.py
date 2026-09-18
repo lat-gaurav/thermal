@@ -148,7 +148,10 @@ def fnum(row, key):
 def annotate_from_row(view, row, overlays=True):
     """Draw everything the pipeline itself logged for one frame onto a BGR
     image: the CUBE-valid banner, the ROI it searched, the logged LOS marker
-    (coloured by status), and the Cube's cue. Mutates and returns view.
+    (coloured by status), and the Cube's cue. Mutates view and returns
+    (view, cube_text, cube_colour) -- the last two so a caller that also
+    wants to show the banner's text/colour elsewhere (the side panel, here)
+    does not have to recompute det_valid/valid_hold's meaning a second time.
 
     Shared between this viewer's live loop and tools/rawrec2mp4.py's
     --telemetry export, so a burned-in video and the interactive viewer never
@@ -186,7 +189,7 @@ def annotate_from_row(view, row, overlays=True):
                 cube_colour, 2, cv2.LINE_AA)
 
     if not overlays:
-        return view
+        return view, cube_text, cube_colour
 
     # the crop the pipeline searched, centred on its own LOS -- only the size
     # is logged, not the origin, so the centre is inferred
@@ -209,7 +212,7 @@ def annotate_from_row(view, row, overlays=True):
     if fnum(row, "cue_valid") and None not in cue:
         cv2.drawMarker(view, (int(cue[0]), int(cue[1])),
                         config.TELEMETRY_CUE_COLOR, cv2.MARKER_TILTED_CROSS, 18, 2)
-    return view
+    return view, cube_text, cube_colour
 
 
 def main():
@@ -380,7 +383,7 @@ def main():
 
         row = per_frame[frame_idx]
         view = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
-        view = annotate_from_row(view, row, overlays=overlays)
+        view, cube_text, cube_colour = annotate_from_row(view, row, overlays=overlays)
 
         logged = (fnum(row, "los_x"), fnum(row, "los_y"))
         pred = our_point(frame_idx)

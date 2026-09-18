@@ -286,7 +286,7 @@ def main():
                     # already safe to mutate -- unlike cache_img itself, which
                     # is reused across a held gap and must not be drawn on.
                     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-                    img = tv.annotate_from_row(img, per_frame[i], overlays=True)
+                    img, _, _ = tv.annotate_from_row(img, per_frame[i], overlays=True)
                 if not args.no_overlay:
                     if not args.telemetry:
                         img = img.copy()  # see above: cache_img must stay clean
