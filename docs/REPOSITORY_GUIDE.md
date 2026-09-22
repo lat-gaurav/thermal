@@ -340,6 +340,15 @@ does not:
   so a crash mid-write still leaves every prior frame readable (the old
   pipeline lost 5 of 27 recordings, including its two largest flights, to a
   format that needed a finalising index write).
+- **`telemetry.py`** — `TelemetryWriter`: the same bounded-queue-plus-
+  background-thread discipline as `RawRecWriter`, applied to the per-frame CSV.
+  Added after a real sortie (2026-09-18, on the SD-card fallback) showed the
+  main loop's own synchronous `csv_f.flush()` could block for up to 6.3 s at a
+  time when the disk queue backed up — and because that call sat *after* the
+  Cube uplink send in the loop, it didn't just delay the CSV, it froze
+  detection, tracking and the uplink for every subsequent frame until it
+  returned. `offer()` never blocks; a row is dropped and counted
+  (`telem_dropped`, mirroring `raw_dropped`) instead.
 - **`rc_arm.py`** — `RcArm` / `make_arm_switches()`: two independent RC
   switches (ch7 = algorithm, ch6 = record) with Schmitt-trigger hysteresis
   (a switch parked on the threshold must not flip every frame — each flip of
@@ -389,6 +398,15 @@ does not:
   disk space) for whether `thermal-live.service` is *actually doing something
   useful*, not merely "active". Exit code is the worst severity seen, so it
   drops into a cron job or a monitoring check unmodified.
+- **`drop_report.py`** — was a frame dropped while recording, and confirmed by
+  which layer? Cross-checks two independent signals for one or more `.rawrec`
+  files: a timestamp-gap scan over the file's own frame index (ground truth
+  for how many frames are actually in the file) against the matching
+  `los-*.csv`'s `raw_dropped` counter (what the recorder itself believed at
+  the time, per episode — `flight/rawrec.py`'s `RawRecWriter.dropped`). A csv
+  row *inside* a flagged gap window means detection/tracking/uplink kept
+  running through it; zero rows means the whole loop stalled, not only
+  recording (`--list-gaps` for the per-gap detail either way).
 - **`disk_soak.py`**, **`det_bench.py`**, **`tophat_profile.py`** — the
   benchmarking trio: can the recording disk sustain 25 fps with zero drops
   (driving the *real* writer, not `dd`, which only measures page-cache
@@ -609,5 +627,6 @@ python3 tools/flight_pipeline.py --no-uplink \
     --out-csv logs/telemetry/los-S.csv --raw-video logs/rawrec/flight-S.rawrec
 python3 tools/telemetry_viewer.py logs/rawrec/flight-S-01.rawrec  # auto-finds logs/telemetry/los-S.csv
 python3 tools/health_check.py --json                # is the live service actually healthy?
+python3 tools/drop_report.py logs/rawrec/*.rawrec   # any frames dropped while recording?
 python3 tools/rawrec2mp4.py logs/rawrec/flight-S-01.rawrec # -> logs/video/, auto. Review only — never delete the .rawrec
 ```
