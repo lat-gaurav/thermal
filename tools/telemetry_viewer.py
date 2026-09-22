@@ -15,6 +15,12 @@ Nothing is re-run here -- no detector, no filters. Every number shown is
 what was actually recorded, which is the point (and is why playback is
 real-time rather than detector-bound).
 
+The one number that IS computed rather than logged verbatim: the camera's
+own frame-to-frame angular rate (deg/s and ~px/frame), from the same logged
+attitude quaternion -- see per_frame_angular_rate(). Unlike the tracker's own
+omega_deg_s column (present only with a lock, averaged since acquisition),
+this is defined for every frame that has attitude at all.
+
 The one exception is OUR OWN LOS reprojection, drawn for comparison: press
 'i' to anchor it to whatever the pipeline logged as the target on the
 current frame, then watch how a pure attitude-driven reprojection of that
@@ -145,6 +151,42 @@ def fnum(row, key):
         return None
 
 
+def per_frame_angular_rate(per_frame):
+    """deg/s the camera itself was rotating, frame to frame -- [None|float, ...].
+
+    A genuine measurement, not an assumption: qw..qz comes straight off the
+    Cube's ATTITUDE_QUATERNION at 30 Hz (the vehicle's attitude; the camera is
+    rigidly mounted, so its rotation rate is the vehicle's), logged into every
+    row and joined to this frame by t_mono. Total angular speed between two
+    orientations -- 2*arccos(|q1 . q2|) / dt -- same maths as the tracker's own
+    omega_deg_s, just PER FRAME rather than averaged since the tracker's last
+    acquisition, and defined whether or not anything is locked.
+
+    DELIBERATELY NOT WRITTEN BACK INTO THE ROW DICTS: join_by_t_mono can map
+    several consecutive frames onto the SAME underlying csv row (whenever
+    per-frame logging fell behind the camera -- e.g. during a slow full-frame
+    detector search), so mutating a row here would leak into every other frame
+    sharing it. This returns its own list, indexed by frame, instead.
+
+    A gap in logged attitude (idle rows carry no quaternion at all) breaks the
+    chain rather than being bridged over -- an average across an idle spell of
+    unknown length is not "the rate that frame", so it is left None instead.
+    """
+    out = [None] * len(per_frame)
+    prev_q = prev_t = None
+    for i, row in enumerate(per_frame):
+        q = tuple(fnum(row, k) for k in ("qw", "qx", "qy", "qz"))
+        t = fnum(row, "t_mono")
+        if None in q or t is None:
+            prev_q = prev_t = None
+            continue
+        if prev_q is not None and t != prev_t:
+            dot = min(1.0, max(-1.0, abs(sum(a * b for a, b in zip(q, prev_q)))))
+            out[i] = np.degrees(2 * np.arccos(dot)) / abs(t - prev_t)
+        prev_q, prev_t = q, t
+    return out
+
+
 def annotate_from_row(view, row, overlays=True):
     """Draw everything the pipeline itself logged for one frame onto a BGR
     image: the CUBE-valid banner, the ROI it searched, the logged LOS marker
@@ -243,6 +285,7 @@ def main():
     per_frame = join_by_t_mono(frame_times, rows)
     present = [(title, [k for k in keys if k in fields]) for title, keys in GROUPS]
     present = [(title, keys) for title, keys in present if keys]
+    cam_omega = per_frame_angular_rate(per_frame)
 
     # Our own reprojection needs attitude on the same clock. The csv's
     # qw..qz columns are the same in both schemas, so this works either way.
@@ -437,6 +480,26 @@ def main():
             for k in keys:
                 v = (row or {}).get(k, "")
                 line(f"{k:<15s}{v if v != '' else '-'}", indent=4)
+
+        # -- camera angular rate ----------------------------------------------
+        # Derived here, not a csv column: the vehicle's total rotation rate
+        # frame-to-frame, from the SAME logged qw..qz the attitude group above
+        # shows as a raw orientation. Unlike the tracker's own omega_deg_s
+        # (present only with a lock, averaged since acquisition), this is
+        # defined for every frame that has attitude at all.
+        line("")
+        line("-- camera rate ---------", (0, 180, 255))
+        rate = cam_omega[frame_idx]
+        if rate is None:
+            line("unavailable (gap in att)", (160, 160, 160), indent=4)
+        else:
+            line(f"{'omega':<15s}{rate:.1f} deg/s", indent=4)
+            if focal:
+                # Same px/frame the Jetson rig's imu_live coaches a pan by
+                # (README.md) -- the number that actually says whether this
+                # motion is trackable, not just how fast the airframe turned.
+                px_per_frame = rate * (focal * np.pi / 180.0) * base_interval
+                line(f"{'~px/frame':<15s}{px_per_frame:.1f}", indent=4)
 
         line("")
         line("-- ours ---------------", (0, 180, 255))
