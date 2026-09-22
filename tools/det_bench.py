@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """det_bench.py -- measure detector cost per frame on a .rawrec recording.
 
-    tools/det_bench.py logs/flight-20260908-165326-db6f3cbe-01.rawrec
+    tools/det_bench.py logs/rawrec/flight-20260908-165326-db6f3cbe-01.rawrec
     tools/det_bench.py FILE.rawrec -n 500 --from 1800     500 frames from 1800
     tools/det_bench.py FILE.rawrec --threads 1            pin OpenCV to 1 core
     tools/det_bench.py FILE.rawrec --tophat               also bench tophat_scr

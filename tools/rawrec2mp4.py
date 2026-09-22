@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert a .rawrec capture to an H.264 mp4 for human review.
 
-    rawrec2mp4.py logs/flight-20260915-132340-26fd36c7-01.rawrec
+    rawrec2mp4.py logs/rawrec/flight-20260915-132340-26fd36c7-01.rawrec
     rawrec2mp4.py flight.rawrec -o out.mp4 --crf 20 --scale 0.5
     rawrec2mp4.py flight.rawrec --start 30 --end 90     seconds into the recording
     rawrec2mp4.py flight.rawrec --as-captured --no-overlay   frames back to back, clean
@@ -121,11 +121,32 @@ def draw_overlay(img, rec_idx, t_rel, t_mono, held, mag=1.0):
     return img
 
 
+def default_out_path(src):
+    """Where the .mp4 goes when --out is not given.
+
+    Alongside the source by default. But when the source lives in a directory
+    literally named 'rawrec' -- this repo's on-disk layout (logs/rawrec/ for
+    raw captures, logs/video/ for derived mp4s; see docs/REPOSITORY_GUIDE.md)
+    -- the sibling video/ directory is used instead, created if it doesn't
+    exist yet. So `rawrec2mp4.py logs/rawrec/flight-S-01.rawrec` lands the
+    output where someone browsing by file type expects it, with no --out
+    needed on every call, while a .rawrec used from anywhere else keeps the
+    old alongside-the-source behaviour untouched.
+    """
+    if src.parent.name == "rawrec":
+        video_dir = src.parent.parent / "video"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        return video_dir / src.with_suffix(".mp4").name
+    return src.with_suffix(".mp4")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("rawrec")
-    ap.add_argument("-o", "--out", help="default: alongside the input, .mp4")
+    ap.add_argument("-o", "--out", help="default: alongside the input, .mp4 -- "
+                                        "or, if the input is under a 'rawrec/' "
+                                        "directory, the sibling 'video/' one")
     ap.add_argument("--fps", type=float, default=None,
                     help="override the rate measured from the timestamps")
     ap.add_argument("--crf", type=int, default=23,
@@ -159,7 +180,7 @@ def main():
     src = pathlib.Path(args.rawrec)
     if not src.is_file():
         sys.exit("%s: no such file" % src)
-    out = pathlib.Path(args.out) if args.out else src.with_suffix(".mp4")
+    out = pathlib.Path(args.out) if args.out else default_out_path(src)
 
     meta = rv.read_header(src)
     frames = rv.build_index(src, meta)

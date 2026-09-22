@@ -500,6 +500,48 @@ are simply frozen at `d816a3f`).
 
 ## 7. Data formats reference
 
+### On-disk layout: `logs/`
+
+Flight-pipeline output is organised by file type, not flattened into one
+directory:
+
+```
+logs/
+  rawrec/     flight-<stamp>-NN.rawrec        raw captures (RawRecWriter)
+              flight-<stamp>-NN.rawrec.idx    per-recording frame-offset cache
+                                              (tools/rawrec_viewer.py's build_index();
+                                               disposable, regenerated automatically)
+  telemetry/  los-<stamp>.csv                 per-frame flight telemetry
+              los-<stamp>.meta.json           the sortie's full parameter set
+  video/      flight-<stamp>-NN.mp4           .rawrec -> mp4 review copies
+              <...>_annotated.mp4             (tools/rawrec2mp4.py, never the source of truth)
+```
+
+- **`rawrec/` + `telemetry/` are created on every start** by
+  `deploy/run_live.sh`'s `resolve_log_dir()`, on whatever filesystem
+  `THERMAL_LOG_DIR` (or its fallback) resolved to — the existing free-space
+  reserve check already covers both, since it's a check on that parent
+  directory, not on a specific subfolder.
+- **`los-<stamp>.meta.json` always lands beside its `.csv`**, wherever that is
+  — `tools/flight_pipeline.py`'s `write_session_meta()` derives its path from
+  `--out-csv` directly (`os.path.splitext(out_csv)[0] + ".meta.json"`), so
+  the two never need separate configuration.
+- **`.rawrec.idx` always lands beside its `.rawrec`** for the same reason —
+  `_index_cache_path()` is `str(rawrec_path) + ".idx"`, so it follows the
+  `.rawrec` into `rawrec/` automatically.
+- **Cross-referencing a `.rawrec` to its `.csv`** (`experiment/los_static_track.py`'s
+  `find_los_csv()`, used by every viewer and by `rawrec2mp4.py --telemetry`)
+  checks, in order: the same directory as the `.rawrec`; the sibling
+  `telemetry/` next to a `rawrec/` one; then a recursive search under the
+  `.rawrec`'s parent and grandparent. This still finds a CSV in an
+  arbitrarily-named subfolder (a `no_drone/`/`drone/` split, say) — it does
+  not require the `rawrec/`+`telemetry/` convention, it just resolves it in
+  the fewest filesystem calls when that convention *is* what's on disk.
+- **`tools/rawrec2mp4.py`** without `-o`/`--out` writes into the sibling
+  `video/` directory automatically when its input's parent directory is named
+  `rawrec` (creating `video/` if needed); otherwise it falls back to writing
+  beside the input, unchanged from before this layout existed.
+
 ### `.rawrec` — the raw capture format (`flight/rawrec.py`)
 
 Self-describing, so no sidecar file is needed (unlike `record_raw.c`'s
@@ -564,8 +606,8 @@ bash deploy/setup_comms.sh                          # bring up the Cube UART + d
 bash deploy/install.sh --check                      # preflight the systemd unit
 python3 tools/live_track.py --no-uplink             # bench the whole live chain, transmit nothing
 python3 tools/flight_pipeline.py --no-uplink \
-    --out-csv logs/los-S.csv --raw-video logs/flight-S.rawrec
-python3 tools/telemetry_viewer.py logs/flight-S-01.rawrec --csv logs/los-S.csv
+    --out-csv logs/telemetry/los-S.csv --raw-video logs/rawrec/flight-S.rawrec
+python3 tools/telemetry_viewer.py logs/rawrec/flight-S-01.rawrec  # auto-finds logs/telemetry/los-S.csv
 python3 tools/health_check.py --json                # is the live service actually healthy?
-python3 tools/rawrec2mp4.py logs/flight-S-01.rawrec # for human review only — never delete the .rawrec
+python3 tools/rawrec2mp4.py logs/rawrec/flight-S-01.rawrec # -> logs/video/, auto. Review only — never delete the .rawrec
 ```

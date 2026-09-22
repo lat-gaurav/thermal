@@ -83,20 +83,36 @@ def find_los_csv(rawrec_path, override=None):
     """Locate the los-*.csv matching a flight-*.rawrec.
 
     Same stamp, different prefix and no episode suffix: flight-<stamp>-NN.rawrec
-    pairs with los-<stamp>.csv. It isn't always in the same directory (some
-    live under a no_drone/ or drone/ subfolder), so fall back to a recursive
-    search under the .rawrec's parent.
+    pairs with los-<stamp>.csv. Checked in order, cheapest and most specific
+    first:
+
+      1. same directory as the .rawrec (the old, flat layout).
+      2. a sibling 'telemetry/' directory next to a 'rawrec/' one -- this
+         repo's on-disk layout (see logs/, docs/REPOSITORY_GUIDE.md): captures
+         live in logs/rawrec/, their matching CSVs in logs/telemetry/.
+      3. a recursive search, first under the .rawrec's own parent and then
+         under its parent's parent -- covers a dataset split into arbitrary
+         subfolders (a no_drone/ or drone/ split, say) without hardcoding
+         their names, and still finds (2) even if the two type-folders are
+         nested one level deeper than expected.
     """
     if override:
         return pathlib.Path(override)
     rawrec_path = pathlib.Path(rawrec_path)
     stem = re.sub(r"-\d+$", "", rawrec_path.stem)
     los_name = stem.replace("flight-", "los-", 1) + ".csv"
+
     same_dir = rawrec_path.parent / los_name
     if same_dir.is_file():
         return same_dir
-    for hit in sorted(rawrec_path.parent.glob(f"**/{los_name}")):
-        return hit
+
+    sibling = rawrec_path.parent.parent / "telemetry" / los_name
+    if sibling.is_file():
+        return sibling
+
+    for ancestor in (rawrec_path.parent, rawrec_path.parent.parent):
+        for hit in sorted(ancestor.glob(f"**/{los_name}")):
+            return hit
     return None
 
 

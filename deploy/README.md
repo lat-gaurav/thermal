@@ -118,6 +118,16 @@ expects. What carries over, and what deliberately does not:
 | horizon crop / draw | yes | **absent** |
 | MJPEG preview | port 8000 | **absent** — use `web` mode |
 
+**On-disk layout.** File *names* are unchanged from the old service, but
+`run_live.sh` now writes them into type subfolders under `$THERMAL_LOG_DIR`:
+raw captures to `rawrec/flight-<stamp>-NN.rawrec`, the per-frame CSV and its
+`.meta.json` sidecar to `telemetry/los-<stamp>.csv` — created on every start,
+on the same filesystem `$THERMAL_LOG_DIR` already resolved to, so the existing
+disk-reserve check covers both. `tools/rawrec2mp4.py` follows the same
+convention: run against a file under `rawrec/`, its `.mp4` lands in the
+sibling `video/` directory automatically. See
+[docs/REPOSITORY_GUIDE.md](../docs/REPOSITORY_GUIDE.md) for the full layout.
+
 ### What is genuinely missing, not just renamed
 
 The old pipeline compensated for camera rotation by warping the frame or by
