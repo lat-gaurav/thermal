@@ -83,6 +83,13 @@ resolve_log_dir() {
   fi
   mkdir -p "$LOG_DIR_USED" || die "cannot create $LOG_DIR_USED"
   [ -w "$LOG_DIR_USED" ] || die "$LOG_DIR_USED is not writable"
+  # Type-organised layout: raw captures in rawrec/, per-frame CSV + its
+  # .meta.json sidecar in telemetry/ (see docs/REPOSITORY_GUIDE.md). Both are
+  # created up front, on the same filesystem as $LOG_DIR_USED, so the
+  # free-space check just above already covers them -- there is nothing to
+  # check separately.
+  mkdir -p "$LOG_DIR_USED/rawrec" "$LOG_DIR_USED/telemetry" \
+    || die "cannot create rawrec/ and telemetry/ under $LOG_DIR_USED"
   # Say how long recording can actually last, because on the SD card that is
   # minutes, not hours, and the reserve guard will stop mid-sortie.
   local free_mb; free_mb="$(df -Pm "$LOG_DIR_USED" | tail -1 | awk '{print $4}')"
@@ -198,9 +205,9 @@ case "$MODE" in
     ARGS=("$REPO/tools/flight_pipeline.py" --camera "$DEVICE"
           --width "$WIDTH" --height "$HEIGHT"
           --cube "$CUBE_DEVICE" --baud "$CUBE_BAUD"
-          --out-csv "$LOG_DIR_USED/los-${S}.csv"
+          --out-csv "$LOG_DIR_USED/telemetry/los-${S}.csv"
           --raw-reserve-mb "$RESERVE_USED")
-    [ "$RECORD" = "1" ] && ARGS+=(--raw-video "$LOG_DIR_USED/flight-${S}.rawrec")
+    [ "$RECORD" = "1" ] && ARGS+=(--raw-video "$LOG_DIR_USED/rawrec/flight-${S}.rawrec")
     [ "$UPLINK" = "1" ] || ARGS+=(--no-uplink)
     [ "$ALWAYS_ON" = "1" ] && ARGS+=(--always-on)
     [ -n "$DETECTOR" ] && ARGS+=(--detector "$DETECTOR")
