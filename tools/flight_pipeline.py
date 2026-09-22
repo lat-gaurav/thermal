@@ -47,7 +47,6 @@ WHAT IS NOT HERE, and you should know before flying it:
   that one.
 """
 import argparse
-import csv
 import json
 import math
 import os
@@ -72,6 +71,7 @@ from comms.cube_link import CubeLink
 from comms.los import LosSolver
 from flight.camera import FlightCamera
 from flight.rawrec import RawRecWriter
+from flight.telemetry import TelemetryWriter
 from flight.preview import Preview
 from flight.rc_arm import RcArm
 
@@ -124,6 +124,11 @@ CSV_HEADER = [
     "rec_idx",
     # cost
     "det_ms", "loop_ms", "skipped",
+    # rows the telemetry writer's own queue has had to drop so far this file
+    # (see flight/telemetry.py) -- the CSV's equivalent of raw_dropped above,
+    # for the same reason: a disk too slow to keep up should cost log
+    # completeness, never a live frame.
+    "telem_dropped",
 ]
 
 
@@ -402,11 +407,13 @@ def main():
     print("  csv         %s" % (args.out_csv or "OFF (no --out-csv)"))
     print("=" * 72, flush=True)
 
-    csv_f = csv_w = None
+    csv_f = None
     if args.out_csv:
-        csv_f = open(args.out_csv, "w", newline="")
-        csv_w = csv.writer(csv_f)
-        csv_w.writerow(CSV_HEADER)
+        # TelemetryWriter, not a bare csv.writer: rows are queued and drained on
+        # a background thread, exactly like RawRecWriter below -- a slow disk
+        # must cost CSV completeness, never stall detection/tracking/uplink.
+        # See flight/telemetry.py's docstring for the sortie that motivated this.
+        csv_f = TelemetryWriter(args.out_csv, CSV_HEADER).open()
         # The configuration this sortie ran with, beside the data it produced.
         mp = write_session_meta(os.path.splitext(args.out_csv)[0] + ".meta.json",
                                 args, det_name, init_name, link)
@@ -510,6 +517,13 @@ def main():
     # slowdown within a second instead of averaging it away.
     fps_ewma = None
     t_prev_frame = None
+    # Wall-clock gap between the STARTS of consecutive iterations -- deliberately
+    # independent of loop_ms below, which only times grab-through-uplink and so
+    # cannot see a blocking call AFTER it (that is exactly what let the
+    # 2026-09-18 csv_f.flush() stall go unnoticed live; see flight/telemetry.py).
+    # This catches a stall anywhere in the iteration, from any future cause, not
+    # just the one already fixed.
+    t_iter_prev = None
     total_skipped = 0
     n_cue_disagree = n_cue_sent = 0
     cue_bad_frames = 0
@@ -538,6 +552,13 @@ def main():
                 time.sleep(config.FLIGHT_IDLE_SLEEP_S)
                 continue
             t_loop = time.monotonic()
+            if t_iter_prev is not None:
+                iter_s = t_loop - t_iter_prev
+                if iter_s > config.LOOP_STALL_WARN_S:
+                    print("\n[STALL] previous iteration took %.2fs (> %.1fs) -- "
+                          "detection/tracking/uplink were blocked for that long"
+                          % (iter_s, config.LOOP_STALL_WARN_S), flush=True)
+            t_iter_prev = t_loop
 
             # ---- web controls: detector/initialiser hot-swap ----------------
             # Applied here, once per frame at the top of the loop, rather than
@@ -621,12 +642,12 @@ def main():
             # ---- algo off: the recorder is already fed by the camera thread ----
             if not armed:
                 n_idle += 1
-                if csv_w:
+                if csv_f is not None:
                     row = [""] * len(CSV_HEADER)
                     row[0:3] = ["", "%.6f" % t_frame, "%.6f" % time.time()]
                     row[8:16] = [0, arm_reason, rc_arm_us, int(recording), rec_reason,
                                  rc_rec_us, episode, rec.frames if rec else ""]
-                    csv_w.writerow(row)
+                    csv_f.offer(row)
                 if preview is not None:
                     # The panel must be populated while IDLE too -- this is the
                     # state the crew watches BEFORE arming, and a page that only
@@ -1052,8 +1073,8 @@ def main():
                     "min_scr": config.DETECTOR_MIN_SCR,
                 })
 
-            if csv_w:
-                csv_w.writerow([
+            if csv_f is not None:
+                csv_f.offer([
                     idx, "%.6f" % t_frame, "%.6f" % time.time(),
                     "%.6f" % q[0], "%.6f" % q[1], "%.6f" % q[2], "%.6f" % q[3],
                     "%.1f" % att_age_ms,
@@ -1094,9 +1115,8 @@ def main():
                     src.grabbed, rec.dropped if rec else "",
                     rec.frames - 1 if rec else "",
                     "%.1f" % det_ms, "%.1f" % loop_ms, skipped,
+                    csv_f.dropped,
                 ])
-                if n_proc % config.FLIGHT_CSV_FLUSH_FRAMES == 0:
-                    csv_f.flush()
 
             now = time.monotonic()
             if now - t_status >= args.status_every:
@@ -1125,7 +1145,9 @@ def main():
         if preview is not None:
             preview.stop()
         if csv_f is not None:
-            csv_f.close()
+            st = csv_f.close()
+            print("[csv] %s  %d rows, %d dropped"
+                  % (st["path"], st["written"], st["dropped"]))
         el_s = max(time.monotonic() - t_run, 1e-9)
         print("\n[done] %d processed (%.2f fps), %d tracking, %d idle, "
               "%d grabbed, %d sent, %d lock(s) dropped"

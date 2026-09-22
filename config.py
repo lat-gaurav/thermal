@@ -486,8 +486,35 @@ FLIGHT_STATUS_EVERY_S = 60.0   # seconds between [status] lines in the journal.
                                # which is exactly when it would mislead.
 FLIGHT_CSV_FLUSH_FRAMES = 30   # ~1 s of frames. A power cut loses at most this
                                # many rows; the .rawrec beside it has no
-                               # finalisation step and loses none.
+                               # finalisation step and loses none. Read by
+                               # flight/telemetry.py's writer THREAD now, not
+                               # the main loop -- see TELEM_QDEPTH_ROWS below.
 FLIGHT_IDLE_SLEEP_S = 0.002    # main-loop sleep when no new frame has arrived
+
+# flight/telemetry.py: TelemetryWriter, the CSV's own RawRecWriter-equivalent.
+# Queued rows, drained on a background thread, exactly like flight/rawrec.py --
+# see that module's docstring for why (2026-09-18: a synchronous csv_f.flush()
+# sitting in the main loop blocked detection, tracking AND the Cube uplink for
+# up to 6.3 s at a time when the SD-card fallback couldn't keep up, not merely
+# the CSV -- see close_episode()'s docstring in tools/flight_pipeline.py for
+# the identical failure this repo already fixed once, for RawRecWriter.close()).
+TELEM_QDEPTH_ROWS = 300        # ~12 s of rows at 25 fps (rows are ~120-200 B,
+                               # so this is trivial memory) -- deep enough to
+                               # absorb every stall actually observed (worst
+                               # measured: 6.3 s) without dropping a row, while
+                               # staying bounded. A row is DROPPED AND COUNTED
+                               # (telem_dropped, the CSV's last column) if the
+                               # disk genuinely can't keep up for longer than
+                               # this buffers -- never blocks the caller.
+LOOP_STALL_WARN_S = 0.5        # print [STALL] when one main-loop iteration
+                               # takes longer than this. Not an arbitrary
+                               # number: it is RPI_COMMS.md's LAT_DET_TIMEOUT_S
+                               # -- the firmware's own detection-staleness
+                               # timeout -- so this fires exactly when guidance
+                               # is about to start treating our detection as
+                               # stale, which is the moment worth knowing about
+                               # live rather than discovering days later in a
+                               # forensic CSV diff (tools/drop_report.py).
 
 # ===========================================================================
 # 12. VIEWERS AND TOOLS
