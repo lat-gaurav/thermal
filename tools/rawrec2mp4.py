@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert a .rawrec capture to an H.264 mp4 for human review.
 
-    rawrec2mp4.py logs/rawrec/flight-20260915-132340-26fd36c7-01.rawrec
+    rawrec2mp4.py logs/flight-20260915-132340-26fd36c7-01.rawrec
     rawrec2mp4.py flight.rawrec -o out.mp4 --crf 20 --scale 0.5
     rawrec2mp4.py flight.rawrec --start 30 --end 90     seconds into the recording
     rawrec2mp4.py flight.rawrec --as-captured --no-overlay   frames back to back, clean
@@ -56,8 +56,6 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent))
 
 import rawrec_viewer as rv          # noqa: E402  read_header/build_index/measured_fps
-import telemetry_viewer as tv       # noqa: E402  --telemetry: annotate_from_row + the
-                                    # same csv join telemetry_viewer.py itself uses
 
 
 def stretch_params(path, meta, frames, n_sample=60):
@@ -97,7 +95,7 @@ def to8(buf, meta, stretch):
 
 
 def draw_overlay(img, rec_idx, t_rel, t_mono, held, mag=1.0):
-    """Burn the join key in. Mutates and returns img (8-bit, 1 or 3 channel).
+    """Burn the join key in. Mutates and returns img (8-bit, single channel).
 
     mag PRE-COMPENSATES FOR --scale. The text is drawn at capture resolution and
     ffmpeg downscales the whole frame afterwards, so at --scale 0.5 a fixed font
@@ -108,45 +106,19 @@ def draw_overlay(img, rec_idx, t_rel, t_mono, held, mag=1.0):
     if held:
         txt += "   [HELD: gap in recording]"
     fs = 0.6 * mag
-    # A plain int colour is cv::Scalar(v, 0, 0, 0) on a 3-channel image --
-    # pure blue, not white. Replicate across channels so --telemetry's BGR
-    # frames still get an actual black/white overlay, not a blue one.
-    is_colour = img.ndim == 3
     # Drawn twice: black underlay then white, so it stays readable over both a
     # hot sky and a cold one. A filled box would hide pixels that matter.
-    for v, thick in ((0, max(2, int(round(4 * mag)))), (255, max(1, int(round(mag))))):
-        colour = (v, v, v) if is_colour else v
+    for colour, thick in ((0, max(2, int(round(4 * mag)))), (255, max(1, int(round(mag))))):
         cv2.putText(img, txt, (int(12 * mag), img.shape[0] - int(14 * mag)),
                     cv2.FONT_HERSHEY_SIMPLEX, fs, colour, thick, cv2.LINE_AA)
     return img
-
-
-def default_out_path(src):
-    """Where the .mp4 goes when --out is not given.
-
-    Alongside the source by default. But when the source lives in a directory
-    literally named 'rawrec' -- this repo's on-disk layout (logs/rawrec/ for
-    raw captures, logs/video/ for derived mp4s; see docs/REPOSITORY_GUIDE.md)
-    -- the sibling video/ directory is used instead, created if it doesn't
-    exist yet. So `rawrec2mp4.py logs/rawrec/flight-S-01.rawrec` lands the
-    output where someone browsing by file type expects it, with no --out
-    needed on every call, while a .rawrec used from anywhere else keeps the
-    old alongside-the-source behaviour untouched.
-    """
-    if src.parent.name == "rawrec":
-        video_dir = src.parent.parent / "video"
-        video_dir.mkdir(parents=True, exist_ok=True)
-        return video_dir / src.with_suffix(".mp4").name
-    return src.with_suffix(".mp4")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("rawrec")
-    ap.add_argument("-o", "--out", help="default: alongside the input, .mp4 -- "
-                                        "or, if the input is under a 'rawrec/' "
-                                        "directory, the sibling 'video/' one")
+    ap.add_argument("-o", "--out", help="default: alongside the input, .mp4")
     ap.add_argument("--fps", type=float, default=None,
                     help="override the rate measured from the timestamps")
     ap.add_argument("--crf", type=int, default=23,
@@ -164,14 +136,6 @@ def main():
                     help="emit frames back to back, ignoring the timestamps")
     ap.add_argument("--no-overlay", action="store_true",
                     help="clean pixels: no rec_idx/time burn-in")
-    ap.add_argument("--telemetry", action="store_true",
-                    help="also burn in the logged CUBE-valid banner, ROI box, "
-                         "LOS marker and cue -- the same annotate_from_row() "
-                         "tools/telemetry_viewer.py draws, from that flight's "
-                         "own los-*.csv. Needs a matching csv (auto-found, or "
-                         "pass --csv). Output becomes colour, not grey.")
-    ap.add_argument("--csv", help="override: path to the matching los-*.csv "
-                                  "(only used with --telemetry)")
     args = ap.parse_args()
 
     ff = shutil.which("ffmpeg")
@@ -180,7 +144,7 @@ def main():
     src = pathlib.Path(args.rawrec)
     if not src.is_file():
         sys.exit("%s: no such file" % src)
-    out = pathlib.Path(args.out) if args.out else default_out_path(src)
+    out = pathlib.Path(args.out) if args.out else src.with_suffix(".mp4")
 
     meta = rv.read_header(src)
     frames = rv.build_index(src, meta)
@@ -190,18 +154,6 @@ def main():
 
     t0 = frames[0][1]
     span = frames[-1][1] - t0
-
-    per_frame = None
-    if args.telemetry:
-        los_track = rv._load_los_track()
-        csv_path = pathlib.Path(args.csv) if args.csv else los_track.find_los_csv(src)
-        if csv_path is None or not pathlib.Path(csv_path).is_file():
-            sys.exit("%s: no matching los-*.csv found for --telemetry "
-                      "(pass --csv to point at one)" % src)
-        rows, _fields = tv.load_telemetry(csv_path)
-        if not rows:
-            sys.exit("%s: no rows with a usable t_mono" % csv_path)
-        per_frame = tv.join_by_t_mono([t for _, t in frames], rows)
 
     # yuv420p needs even dimensions, and an odd one makes ffmpeg fail after the
     # whole read has already happened.
@@ -229,8 +181,6 @@ def main():
     if args.scale != 1.0:
         print("  scale       %.2f -> %dx%d" % (args.scale, ow, oh))
     print("  overlay     %s" % ("off" if args.no_overlay else "rec_idx + time"))
-    if args.telemetry:
-        print("  telemetry   %s (CUBE-valid banner, ROI, LOS marker, cue)" % csv_path)
     print("  timebase    %s" % ("as-captured: frames back to back, video time "
                                 "will NOT match real time" if args.as_captured
                                 else "real: video time == recording time"))
@@ -277,8 +227,8 @@ def main():
         print("              recording is missing -- dropped at capture time)")
 
     cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "rawvideo", "-pix_fmt", "bgr24" if args.telemetry else "gray",
-           "-s", "%dx%d" % (W, H), "-r", "%.6f" % fps, "-i", "-",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-s", "%dx%d" % (W, H),
+           "-r", "%.6f" % fps, "-i", "-",
            "-an", "-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
            "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
     if (ow, oh) != (W, H):
@@ -302,16 +252,10 @@ def main():
                     cache_img = to8(buf, meta, stretch)
                     cache_i = i
                 img = cache_img
-                if args.telemetry:
-                    # cvtColor always allocates a fresh array, so this is
-                    # already safe to mutate -- unlike cache_img itself, which
-                    # is reused across a held gap and must not be drawn on.
-                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-                    img, _, _ = tv.annotate_from_row(img, per_frame[i], overlays=True)
                 if not args.no_overlay:
-                    if not args.telemetry:
-                        img = img.copy()  # see above: cache_img must stay clean
-                    img = draw_overlay(img, i, t_rel, frames[i][1], held,
+                    # copy(): the cached frame is reused across a held gap, and
+                    # drawing in place would stack the text on every repeat.
+                    img = draw_overlay(img.copy(), i, t_rel, frames[i][1], held,
                                        mag=1.0 / args.scale if args.scale else 1.0)
                 proc.stdin.write(img.tobytes())
                 written += 1
