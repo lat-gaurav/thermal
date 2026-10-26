@@ -13,9 +13,9 @@ what flies operationally: it needs no one watching a screen. This is the
 manual fallback for a bench check, a sortie with no radar cue at all, or a
 scene where the automatic rule (nearest-to-cue, or rightmost-isolated) picks
 the wrong blob out of a clutter field and a human can tell at a glance which
-one is real. Select it with --initialiser manual_click (or THERMAL_INITIALISER
-in /etc/default/thermal-live) -- it does not replace FLIGHT_INITIALISER's
-default.
+one is real. Since 2026-10-26 this IS config.FLIGHT_INITIALISER's default; cue_nearest is
+selected back with --initialiser cue_nearest (or THERMAL_INITIALISER in
+/etc/default/thermal-live).
 
 WHAT THIS DELIBERATELY DOES NOT DO. Same as cue_nearest: it does not move,
 weight, or filter any detection, and it does not substitute the click for

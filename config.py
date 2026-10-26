@@ -148,7 +148,14 @@ LOS_PROXIMITY_MAX_DIST_PX = 150.0  # how far a detection may sit from the LOS
 # Chosen BY NAME, never by whichever file sorts first: dropping a new .py into
 # initialisation/ used to change what acquires the target, and in flight that
 # must not depend on a filename.
-FLIGHT_INITIALISER = "cue_nearest"         # tools/flight_pipeline.py
+#
+# DEFAULT IS MANUAL (2026-10-26, was "cue_nearest"). The operator watches the
+# preview and clicks the target; nothing acquires by itself. NOTE this line is
+# only consulted on frames where the cue IS valid -- flight_pipeline.py picks
+# CUELESS_INITIALISER instead whenever no cue is arriving, so with a dead or
+# absent cue link this setting is never reached. The two must agree for
+# acquisition to be manual end to end.
+FLIGHT_INITIALISER = "manual_click"        # tools/flight_pipeline.py
 VIEWER_INITIALISER = "rightmost_isolated"  # the offline viewers, which have no
                                            # cue, so the cue-based one could
                                            # never return anything there.
