@@ -40,15 +40,16 @@ import config
 
 
 class FlightCamera:
-    def __init__(self, device=None, width=None, height=None, fourcc=None):
+    def __init__(self, device=None, width=None, height=None, fourcc=None, history=None):
         self.device = str(config.CAMERA_DEVICE if device is None else device)
         self.w = int(config.CAMERA_WIDTH if width is None else width)
         self.h = int(config.CAMERA_HEIGHT if height is None else height)
         self.fourcc = str(config.CAMERA_FOURCC if fourcc is None else fourcc)
         self.cap = None
+        self.history = history
         self.sink = None            # set to a RawRecWriter to record every frame
         self.lock = threading.Lock()
-        self._latest = None         # (t_mono, frame)
+        self._latest = None         # (t_mono, frame, capture_index)
         self._served = None         # the object last handed out, to detect staleness
         self.running = False
         self.thread = None
@@ -91,6 +92,8 @@ class FlightCamera:
                 continue
             t = time.monotonic()
             self.grabbed += 1
+            if self.history is not None:
+                self.history.append(self.grabbed, t, frame)
             # The recorder gets EVERY frame, straight off this thread.
             sink = self.sink
             if sink is not None:
@@ -98,17 +101,22 @@ class FlightCamera:
             with self.lock:
                 if self._latest is not None and self._latest is not self._served:
                     self.skipped += 1     # the loop never got to the previous one
-                self._latest = (t, frame)
+                self._latest = (t, frame, self.grabbed)
 
-    def read(self):
-        """(t_mono, frame, skipped_since_last_read). frame is None if nothing new."""
+    def read(self, with_index=False):
+        """(time, frame, skipped), optionally followed by capture_index.
+
+        The index counts every captured frame, including processing skips, and
+        never resets on algorithm re-arm. It is scoped to this camera instance.
+        """
         with self.lock:
             cur = self._latest
             if cur is None or cur is self._served:
-                return None, None, 0
+                return (None, None, 0, None) if with_index else (None, None, 0)
             self._served = cur
             skipped, self.skipped = self.skipped, 0
-        return cur[0], cur[1], skipped
+        result = (cur[0], cur[1], skipped)
+        return result + (cur[2],) if with_index else result
 
     def stop(self):
         # Drain the grab thread before releasing: it is parked in a blocking

@@ -289,6 +289,9 @@ class SmoothTracker:
         self.misses = 0
         self.status = "tracking"
         self.drops = getattr(self, "drops", 0)
+        self.last_release = None
+        self.last = {"score": None, "dist_px": None, "gate_px": None,
+                     "omega_deg_s": None, "alpha": None, "n_in_gate": 0}
 
     def release(self, reason="released"):
         """Give up the current reference, so the next frame can acquire afresh.

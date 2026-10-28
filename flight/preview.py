@@ -13,9 +13,9 @@ picture of it. offer() therefore stores a reference and returns; this thread
 annotates and encodes at its own pace and silently drops whatever it could not
 keep up with.
 
-MJPEG, not a page that polls. One `multipart/x-mixed-replace` response streams
-frames as they are produced, so a browser shows a moving image with no
-JavaScript and no reload, and a viewer that disconnects costs nothing.
+The page fetches tagged JPEGs sequentially and displays them on a canvas.
+Each response carries the capture index of that exact JPEG, atomically
+published by the encoder. The legacy MJPEG endpoint remains available.
 
 WHAT IS DRAWN, and why each thing is there:
     detections      every box the detector returned, so you can see whether the
@@ -31,7 +31,8 @@ WHAT IS DRAWN, and why each thing is there:
 
 MANUAL ACQUISITION. The page also accepts a click on the image: the browser
 posts the click's pixel in the JPEG's own (post-scale) coordinate space to
-/api/click, and click_point() below divides that back by PREVIEW_SCALE so
+/api/click along with the displayed capture index. set_click() divides the
+coordinates back by PREVIEW_SCALE so
 every consumer downstream works in the camera's native frame, same as every
 box and the cue point. That point only DOES something if the pipeline is
 running with the manual_click initialiser (initialisation/manual_click.py),
@@ -61,6 +62,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -131,7 +133,7 @@ _INDEX = b"""<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <div id="wrap">
   <div id="left">
-    <div id="imgbox"><img id="img" src="/stream.mjpg"></div>
+    <div id="imgbox"><canvas id="img" width="640" height="512"></canvas></div>
     <div id="clickmsg">click the target to acquire manually (needs the manual_click initialiser)</div>
     <div id="ctrl">
       <label>algorithm</label>
@@ -148,28 +150,48 @@ _INDEX = b"""<!doctype html><html><head><meta charset="utf-8">
   <div id="panel">connecting...</div>
 </div>
 <script>
-// Click-to-acquire: send the click in the JPEG's OWN pixel space (its natural
-// width/height, i.e. already at PREVIEW_SCALE) -- the browser may be
-// stretching or shrinking the displayed <img> to fit the layout, so the click
-// position has to be rescaled from "where on screen" to "which JPEG pixel"
-// before it means anything, and the server maps that back to the camera's
-// native frame from there (see Preview.set_click).
+// Image and capture index come from ONE response. No state poll supplies the
+// displayed index. Draw + metadata assignment have no await between them.
 (function(){
   const img = document.getElementById("img");
   const msg = document.getElementById("clickmsg");
+  const ctx = img.getContext("2d");
+  let displayed = null;
+  async function nextFrame(){
+    try {
+      const resp = await fetch("/frame.jpg", {cache:"no-store"});
+      if(!resp.ok) throw new Error("preview HTTP " + resp.status);
+      const tag = resp.headers.get("X-Capture-Index");
+      const frame_index = tag === null ? NaN : Number(tag);
+      const session = resp.headers.get("X-Preview-Session");
+      if(!Number.isSafeInteger(frame_index) || frame_index < 1 || !session)
+        throw new Error("missing frame index");
+      const bitmap = await createImageBitmap(await resp.blob());
+      img.width = bitmap.width;
+      img.height = bitmap.height;
+      ctx.drawImage(bitmap, 0, 0);
+      displayed = {frame_index, session};
+      bitmap.close();
+    } catch(e) { msg.textContent = "preview: " + e; }
+    // Only one fetch/decode at a time: responses cannot overtake each other.
+    setTimeout(nextFrame, 200);
+  }
+  nextFrame();
   img.addEventListener("click", async (ev) => {
+    if(displayed === null) return;
+    const {frame_index, session} = displayed;
     const r = img.getBoundingClientRect();
     const nx = (ev.clientX - r.left) / r.width;
     const ny = (ev.clientY - r.top) / r.height;
-    const x = Math.round(nx * (img.naturalWidth || r.width));
-    const y = Math.round(ny * (img.naturalHeight || r.height));
+    const x = Math.min(img.width - 1, Math.max(0, Math.round(nx * img.width)));
+    const y = Math.min(img.height - 1, Math.max(0, Math.round(ny * img.height)));
     try {
       const resp = await fetch("/api/click", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({x, y}),
+        body: JSON.stringify({x, y, frame_index, session}),
       });
       msg.textContent = resp.ok
-        ? "acquiring near (" + x + ", " + y + ") ..."
+        ? "clicked frame " + frame_index + " near (" + x + ", " + y + ")"
         : "click rejected: " + (await resp.text());
     } catch (e) { msg.textContent = "click failed: " + e; }
     setTimeout(() => { msg.textContent =
@@ -218,6 +240,9 @@ async function loadOptions(){
 loadOptions();
 
 const G = [
+ ["manual acquisition", ["replay_status","replay_detail","replay_clicked_frame","replay_frame",
+                         "replay_remaining_frames","replay_steps","replay_elapsed_ms",
+                         "replay_click_to_live_ms","replay_worker_ms","replay_handover_frame"]],
  ["pipeline",   ["frame","fps","det_ms","loop_ms","roi","skipped","grabbed","uptime_s"]],
  ["tracker",    ["status","los_x","los_y","gate_px","n_in_gate","det_score","match_dist_px",
                  "alpha","omega_deg_s","misses","drops","last_release"]],
@@ -260,6 +285,14 @@ function fmt(v){
   if(typeof v==="number") return Number.isInteger(v)?v:v.toFixed(3);
   return String(v);
 }
+const replayLabels = {idle:"Waiting for click", past_frames:"Running on clicked frame",
+  catching_up:"Catching up through past frames", ready:"Caught up; awaiting handover",
+  live:"Caught up; tracking live", failed:"Click acquisition failed", cancelled:"Click cancelled"};
+const replayKeys = {replay_status:"Status", replay_detail:"Progress", replay_clicked_frame:"Clicked frame",
+  replay_frame:"Replayed through frame", replay_remaining_frames:"Frames behind",
+  replay_steps:"Replay updates", replay_elapsed_ms:"Since click (ms)",
+  replay_click_to_live_ms:"Click to live (ms)", replay_worker_ms:"Worker to live (ms)",
+  replay_handover_frame:"Live handover frame"};
 async function tick(){
   try{
     const s = await (await fetch("/api/state")).json();
@@ -271,7 +304,8 @@ async function tick(){
       h+="<div class=grp><h2>"+title+"</h2><table>";
       for(const k of keys){
         if(!(k in s)) continue;
-        h+="<tr><td class=k>"+k+"</td><td class='v "+cls(k,s[k])+"'>"+fmt(s[k])+"</td></tr>";
+        const value = k === "replay_status" ? (replayLabels[s[k]] || s[k]) : s[k];
+        h+="<tr><td class=k>"+(replayKeys[k] || k)+"</td><td class='v "+cls(k,s[k])+"'>"+fmt(value)+"</td></tr>";
       }
       h+="</table></div>";
     }
@@ -322,8 +356,11 @@ class Preview:
         self._pending = None          # (frame, overlay) handed over by the loop
         self._state = {}              # everything the page shows, latest wins
         self._jpeg = None             # the most recently encoded frame
+        self._capture_index = None   # belongs to _jpeg, published under _cv
+        self.session = uuid.uuid4().hex  # reject an old image after a restart
+        self.replay = None
         self._seq = 0
-        self._click = None            # (x, y, expire_monotonic) in native-frame px
+        self._click = None            # (x, y, expiry, capture_index, receipt_time)
         self._web_armed = False       # operator's requested algo state, from the page
         self._swap = {}               # pending {"detector"|"initialiser": name}
         self._options = {"detectors": [], "initialisers": [], "filters": []}
@@ -339,7 +376,7 @@ class Preview:
         self.dropped = 0
 
     # ---- producer side ------------------------------------------------------
-    def offer(self, frame, overlay, state=None):
+    def offer(self, frame, overlay, state=None, capture_index=None):
         """Hand over the latest frame and telemetry. Never encodes here.
 
         `state` is published separately from the image and is NOT rate-limited
@@ -353,7 +390,7 @@ class Preview:
         with self._lock:
             if self._pending is not None:
                 self.dropped += 1     # the encoder never got to the previous one
-            self._pending = (frame, dict(overlay))
+            self._pending = (frame, dict(overlay), capture_index)
             if state is not None:
                 self._state = state
 
@@ -367,10 +404,12 @@ class Preview:
         d["preview_fps"] = self.max_fps
         d["preview_encoded"] = self.encoded
         d["preview_dropped"] = self.dropped
+        if self.replay is not None:
+            d.update(self.replay.state())
         return d
 
     # ---- manual acquisition (operator clicks the image) ----------------------
-    def set_click(self, x, y):
+    def set_click(self, x, y, frame_index=None):
         """Record a click, given in the JPEG's OWN pixel space (post-scale).
 
         Divided back by self.scale here, once, so every consumer -- the
@@ -380,22 +419,21 @@ class Preview:
         with self._lock:
             ox = x / self.scale if self.scale else float(x)
             oy = y / self.scale if self.scale else float(y)
-            self._click = (ox, oy, time.monotonic() + config.MANUAL_CLICK_TIMEOUT_S)
+            received = time.monotonic()
+            self._click = (ox, oy, received + config.MANUAL_CLICK_TIMEOUT_S,
+                           frame_index, received)
 
     def click_point(self):
         """(x, y) of a pending click in native-frame pixels, or None.
 
-        Auto-expires: a click that never landed near a real detection must not
-        silently reappear and cause a surprise lock long after the operator
-        moved on. Does NOT clear itself on a merely unsuccessful match -- the
-        caller (an initialiser) clears it explicitly once it actually acquires,
-        via clear_click(), so a click gets a few frames of detector noise to
-        land in before it expires.
+        This is a non-consuming inspection. The flight pipeline uses
+        take_click() for an atomic, one-shot attempt instead. Unprocessed
+        clicks expire so they cannot surprise the operator much later.
         """
         with self._lock:
             if self._click is None:
                 return None
-            x, y, expire = self._click
+            x, y, expire, _index, _received = self._click
             if time.monotonic() > expire:
                 self._click = None
                 return None
@@ -405,6 +443,18 @@ class Preview:
         """Consume the pending click so it cannot re-acquire after a later drop."""
         with self._lock:
             self._click = None
+
+    def take_click(self, with_receipt=False):
+        """Consume (native_x, native_y, clicked_capture_index) for one attempt.
+
+        A click arriving during detection remains pending for the next frame.
+        """
+        with self._lock:
+            click, self._click = self._click, None
+            if click is None or time.monotonic() > click[2]:
+                return None
+            result = (click[0], click[1], click[3])
+            return result + (click[4],) if with_receipt else result
 
     # ---- runtime controls (algo arm, detector/initialiser swap, filters) -----
     def set_options(self, detectors, initialisers, filters=()):
@@ -500,15 +550,17 @@ class Preview:
             self._encoder.join(timeout=2.0)
 
     # ---- consumer side ------------------------------------------------------
-    def latest(self, after_seq, timeout=5.0):
+    def latest(self, after_seq, timeout=5.0, with_index=False):
         """(seq, jpeg) once something newer than after_seq exists, else (seq, None)."""
         deadline = time.monotonic() + timeout
         with self._cv:
             while self._run and self._seq <= after_seq:
                 if not self._cv.wait(max(0.01, deadline - time.monotonic())):
                     if time.monotonic() >= deadline:
-                        return self._seq, None
-            return self._seq, self._jpeg
+                        result = (self._seq, None)
+                        return result + (None,) if with_index else result
+            result = (self._seq, self._jpeg)
+            return result + (self._capture_index,) if with_index else result
 
     # ---- the encoder thread -------------------------------------------------
     def _encode_loop(self):
@@ -520,15 +572,18 @@ class Preview:
             if item is None:
                 time.sleep(0.02)
                 continue
-            frame, ov = item
+            frame, ov, capture_index = item
             try:
                 jpg = self._render(frame, ov)
+                if jpg is None:
+                    continue
             except Exception:
                 # A preview must never be able to take the pipeline down.
                 time.sleep(period)
                 continue
             with self._cv:
                 self._jpeg = jpg
+                self._capture_index = capture_index
                 self._seq += 1
                 self.encoded += 1
                 self._cv.notify_all()
@@ -610,7 +665,7 @@ def _make_handler(preview):
                 self.wfile.write(body)
                 return
             if self.path == "/frame.jpg":
-                seq, jpg = preview.latest(-1, timeout=5.0)
+                seq, jpg, capture_index = preview.latest(-1, timeout=5.0, with_index=True)
                 if jpg is None:
                     self.send_error(503, "no frame yet")
                     return
@@ -618,6 +673,8 @@ def _make_handler(preview):
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(jpg)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Capture-Index", str(capture_index))
+                self.send_header("X-Preview-Session", preview.session)
                 self.end_headers()
                 self.wfile.write(jpg)
                 return
@@ -647,10 +704,15 @@ def _make_handler(preview):
                     length = int(self.headers.get("Content-Length", "0"))
                     body = json.loads(self.rfile.read(length) or b"{}")
                     x, y = float(body["x"]), float(body["y"])
+                    frame_index = body["frame_index"]
+                    if type(frame_index) is not int or frame_index < 1:
+                        raise ValueError("invalid frame index")
+                    if body["session"] != preview.session:
+                        raise ValueError("preview restarted; refresh the image")
                 except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                    self.send_error(400, "expected JSON {\"x\":..,\"y\":..}")
+                    self.send_error(400, "expected x, y, frame_index and current preview session")
                     return
-                preview.set_click(x, y)
+                preview.set_click(x, y, frame_index)
                 body = b'{"ok":true}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

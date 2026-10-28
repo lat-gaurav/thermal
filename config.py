@@ -215,17 +215,20 @@ INIT_MIN_ISOLATION_PX = 100.0  # a candidate counts as isolated if its nearest
 # cue_nearest, just sourced from a person instead of the radar.
 MANUAL_CLICK_MAX_PX = 60.0     # a detection this far from the click is not what
                                # was pointed at. Tighter than CUE_ACQUIRE_MAX_PX:
-                               # a click is a precise, un-aged pixel coordinate,
-                               # not a 0.5 s-old reprojected radar fix, so there
-                               # is no error budget to size this from -- it only
-                               # needs to cover finger/mouse imprecision and the
-                               # preview's own PREVIEW_SCALE rounding.
-MANUAL_CLICK_TIMEOUT_S = 2.0   # how long a click stays armed waiting for a
-                               # matching detection before it is dropped. Long
-                               # enough to survive a frame or two of detector
-                               # noise; short enough that an old click cannot
-                               # cause a surprise lock long after the operator
-                               # moved on to something else.
+                               # intended to cover mouse imprecision and preview
+                               # scaling. Clicks still refer to an older displayed
+                               # frame; frame tagging/latency correction is separate.
+MANUAL_CLICK_TIMEOUT_S = 2.0   # maximum wait before the algorithm picks up a
+                               # click. Once picked up, it gets ONE detection
+                               # attempt and is discarded even on a miss.
+
+# Historical click acquisition. Native GREY frames retain detector calibration.
+CLICK_HISTORY_FRAMES = 50       # ~2 s / 65.5 MB at 1280x1024 and 25 fps
+CLICK_REPLAY_DEADLINE_S = 1.0   # hard worker budget, never stall live tracking
+CLICK_REPLAY_STRIDE = 2         # retry intermediate frame when a step misses
+CLICK_REPLAY_MAX_LAG_FRAMES = 2 # maximum attitude-only bridge at live handover
+CLICK_REPLAY_MAX_MISSES = 3     # abandon candidate after consecutive misses
+CLICK_REPLAY_PADDING_PX = 140   # background support for opening + SCR annulus
 
 # ===========================================================================
 # 5. TRACKER   (experiment/los_static_track.py: SmoothTracker)

@@ -74,6 +74,7 @@ from flight.rawrec import RawRecWriter
 from flight.telemetry import TelemetryWriter
 from flight.preview import Preview
 from flight.rc_arm import RcArm
+from flight.click_replay import FrameHistory, ClickReplay, EVENT_HEADER
 
 CSV_HEADER = [
     # los-*.csv compatibility: t_mono + qw..qz are what experiment/los_static_track.py
@@ -129,6 +130,12 @@ CSV_HEADER = [
     # for the same reason: a disk too slow to keep up should cost log
     # completeness, never a live frame.
     "telem_dropped",
+    # Capture indices count EVERY camera frame, independently of tracker frame.
+    # Click fields are populated only on the row that attempts the override.
+    "capture_frame", "click_frame", "click_used_frame", "click_gap",
+    "click_result", "click_x", "click_y", "click_match_distance_px",
+    "replay_status", "replay_clicked_frame", "replay_frame", "replay_remaining_frames",
+    "replay_click_to_live_ms", "replay_worker_ms", "replay_handover_frame",
 ]
 
 
@@ -445,10 +452,13 @@ def main():
                                                               link.attitude_hz_measured()))
 
     # ---- camera ----
-    src = FlightCamera(args.camera, W, H).start()
+    history = FrameHistory()
+    src = FlightCamera(args.camera, W, H, history=history).start()
+    replay = ClickReplay(history, link, args.focal, cx, cy, args.lookback)
     preview = None
     if args.preview_port:
         preview = Preview(port=args.preview_port).start()
+        preview.replay = replay
         preview.set_options(sorted(detectors), sorted(n for n, _ in initialisers),
                            [n for n, _ in filters])
         print("  preview     http://0.0.0.0:%d/   (%.0f fps, %.0f%% scale, own thread)"
@@ -458,12 +468,17 @@ def main():
     print("=" * 72, flush=True)
 
     csv_f = None
+    click_csv = None
     if args.out_csv:
         # TelemetryWriter, not a bare csv.writer: rows are queued and drained on
         # a background thread, exactly like RawRecWriter below -- a slow disk
         # must cost CSV completeness, never stall detection/tracking/uplink.
         # See flight/telemetry.py's docstring for the sortie that motivated this.
         csv_f = TelemetryWriter(args.out_csv, CSV_HEADER).open()
+        click_path = os.path.join(os.path.dirname(args.out_csv),
+                                  "clicks-" + os.path.basename(args.out_csv))
+        click_csv = TelemetryWriter(click_path, EVENT_HEADER, flush_every=1).open()
+        print("  click events %s" % click_path, flush=True)
         # The configuration this sortie ran with, beside the data it produced.
         mp = write_session_meta(os.path.splitext(args.out_csv)[0] + ".meta.json",
                                 args, det_name, init_name, link)
@@ -598,7 +613,11 @@ def main():
 
     try:
         while not stop:
-            t_frame, frame, skipped = src.read()
+            t_frame, frame, skipped, capture_frame = src.read(with_index=True)
+            for event in replay.drain_events():
+                if click_csv is not None:
+                    click_csv.offer(event)
+                print("[click-replay] %s" % dict(zip(EVENT_HEADER, event)), flush=True)
             if frame is None:
                 time.sleep(config.FLIGHT_IDLE_SLEEP_S)
                 continue
@@ -618,6 +637,7 @@ def main():
             # one place a swap can happen without racing a call in progress.
             if preview is not None:
                 for field, name in preview.pop_swaps().items():
+                    replay.cancel('preview algorithm selection changed')
                     if field == "detector":
                         if name in detectors:
                             detect, det_name = detectors[name], name
@@ -684,6 +704,8 @@ def main():
                         # to coast from. Leaving this set would let the first
                         # frames of a new episode inherit the last one's hold.
                         t_last_track = None
+                        cue_bad_frames = 0
+                        acq_src = ""
                         print("\n[algo] RUNNING  ch%d=%sus" % (algo_arm.chan,
                                                                algo_arm.last_us), flush=True)
                     else:
@@ -692,12 +714,14 @@ def main():
 
             # ---- algo off: the recorder is already fed by the camera thread ----
             if not armed:
+                replay.cancel('algorithm is off')
                 n_idle += 1
                 if csv_f is not None:
                     row = [""] * len(CSV_HEADER)
                     row[0:3] = ["", "%.6f" % t_frame, "%.6f" % time.time()]
                     row[8:16] = [0, arm_reason, rc_arm_us, int(recording), rec_reason,
                                  rc_rec_us, episode, rec.frames if rec else ""]
+                    row[CSV_HEADER.index("capture_frame")] = capture_frame
                     csv_f.offer(row)
                 if preview is not None:
                     # The panel must be populated while IDLE too -- this is the
@@ -710,7 +734,8 @@ def main():
                         "ALGO OFF (%s)  rec %s ep%d" % (
                             arm_reason, "on" if rec is not None else "off", episode),
                         "raw feed; detection and tracking are not running"]},
-                        state={
+                        capture_index=capture_frame, state={
+                            "capture_frame": capture_frame,
                             "frame": None, "fps": None, "det_ms": None,
                             "loop_ms": None, "roi": "-", "skipped": total_skipped,
                             "grabbed": src.grabbed,
@@ -801,6 +826,33 @@ def main():
             frame_times.append(t_frame)
             quats.append(q)
 
+            # Consume before detection: a second click arriving during this
+            # attempt must survive for the next frame. Only manual mode owns it.
+            manual_click = (preview.take_click(with_receipt=True)
+                            if preview is not None and init_name == "manual_click"
+                            else None)
+            manual_point = manual_click[:2] if manual_click is not None else None
+            click_frame = manual_click[2] if manual_click is not None else None
+            click_gap = (capture_frame - click_frame if click_frame is not None else "")
+            click_result, click_distance = "", ""
+            if manual_click is not None:
+                enabled = preview.filters_enabled()
+                replay.submit(manual_point, click_frame, manual_click[3], detect,
+                              [(name, fn) for name, fn in filters
+                               if enabled is None or name in enabled])
+                click_result = "queued"
+
+            # Handover uses a recent confirmed replay point, reprojected to this
+            # current frame's attitude. Never transplant historical frame indices
+            # into the live tracker's separate, re-armable index space.
+            replay_point = replay.take_live(capture_frame, q)
+            manual_matched = replay_point is not None
+            if manual_matched:
+                tracker.set_click(idx, replay_point)
+                acq_src = "manual_click"
+                cue_bad_frames = 0
+                t_last_track = None
+
             # ---- ROI crop from the tracker's own gate ----
             roi, offset, view, gate = "FULL", (0, 0), frame, ""
             if tracker.ref is not None:
@@ -834,11 +886,9 @@ def main():
             ctx = {"los_point": None, "frame_w": W, "frame_h": H,
                    "cue_point": cue_point,
                    # Only meaningful to initialisation/manual_click.py; every
-                   # other initialiser ignores these two keys. No preview
-                   # running (--preview-port 0) means no operator can click
-                   # anything, so both are simply absent then.
-                   "manual_point": preview.click_point() if preview else None,
-                   "manual_clear": preview.clear_click if preview else None}
+                   # other initialiser ignores this key. No preview
+                   # running (--preview-port 0) means no operator can click.
+                   "manual_point": None}  # historical acquisition owns clicks
 
             # ---- which filters run this frame -------------------------------
             # None (no preview) means every loaded filter runs, same as before
@@ -848,7 +898,14 @@ def main():
 
             # ---- acquire, or advance ----
             los_point = None
-            if tracker.ref is None:
+            if manual_matched:
+                kept = boxes
+                for name, fn in filters:
+                    if enabled_filters is not None and name not in enabled_filters:
+                        continue
+                    kept = fn(kept, ctx)
+                n_kept = len(kept)
+            elif tracker.ref is None:
                 kept = boxes
                 for name, fn in filters:
                     if enabled_filters is not None and name not in enabled_filters:
@@ -974,7 +1031,14 @@ def main():
                     # the pipeline that can say the tracker is wrong, because it
                     # is the only signal independent of both the detector and
                     # the tracker.
-                    if cue_resid_deg > config.CUE_DROP_DEG:
+                    # Operator authority lasts while manual mode is selected.
+                    # Still compute/log the residual; switching initialiser
+                    # restores the normal radar release policy.
+                    manual_authority = (init_name == "manual_click"
+                                        and acq_src == "manual_click")
+                    if manual_authority:
+                        cue_bad_frames = 0
+                    elif cue_resid_deg > config.CUE_DROP_DEG:
                         cue_bad_frames += 1
                     else:
                         cue_bad_frames = 0
@@ -1044,7 +1108,8 @@ def main():
                     # panel, where it can be read as numbers instead of
                     # squinted at over the picture.
                     "hud": ["f%d  %s  %s" % (idx, status, roi)],
-                }, state={
+                }, capture_index=capture_frame, state={
+                    "capture_frame": capture_frame,
                     # --- pipeline
                     "frame": idx, "fps": None if fps_ewma is None else round(fps_ewma, 2),
                     "det_ms": round(det_ms, 1), "loop_ms": round(loop_ms, 1),
@@ -1131,6 +1196,7 @@ def main():
                 })
 
             if csv_f is not None:
+                replay_state = replay.state()
                 csv_f.offer([
                     idx, "%.6f" % t_frame, "%.6f" % time.time(),
                     "%.6f" % q[0], "%.6f" % q[1], "%.6f" % q[2], "%.6f" % q[3],
@@ -1173,6 +1239,20 @@ def main():
                     rec.frames - 1 if rec else "",
                     "%.1f" % det_ms, "%.1f" % loop_ms, skipped,
                     csv_f.dropped,
+                    capture_frame,
+                    click_frame if click_frame is not None else "",
+                    capture_frame if manual_point is not None else "",
+                    click_gap, click_result,
+                    manual_point[0] if manual_point is not None else "",
+                    manual_point[1] if manual_point is not None else "",
+                    "%.2f" % click_distance if click_distance != "" else "",
+                    replay_state.get("replay_status", ""),
+                    replay_state.get("replay_clicked_frame", ""),
+                    replay_state.get("replay_frame", ""),
+                    replay_state.get("replay_remaining_frames", ""),
+                    replay_state.get("replay_click_to_live_ms", ""),
+                    replay_state.get("replay_worker_ms", ""),
+                    replay_state.get("replay_handover_frame", ""),
                 ])
 
             now = time.monotonic()
@@ -1196,6 +1276,12 @@ def main():
                 throttle_cache[0] = throttled_word()
                 power_cache[0] = pmic_power()
     finally:
+        replay.close()
+        for event in replay.drain_events():
+            if click_csv is not None:
+                click_csv.offer(event)
+        if click_csv is not None:
+            click_csv.close()
         rec = close_episode(rec)
         for t in closing:
             t.join(timeout=config.RAW_CLOSE_TIMEOUT_S + 2.0)

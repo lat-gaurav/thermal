@@ -1,5 +1,61 @@
 # thermal
 
+## Flight preview click diagnostics (RPi)
+
+In `flight` mode, the web preview displays a canvas image tagged with its
+Pi-generated capture index. Clicking with `manual_click` selected sends that
+same index with the coordinates. A worker detects on that exact historical
+frame, then tracks forward through buffered frames using small detector ROIs.
+The previous live lock continues until a confirmed candidate reaches within
+two capture frames of the live loop. The remaining gap is bridged using
+attitude; no target-velocity extrapolation is applied for that short bridge.
+An unmatched/expired click or a failed replay leaves the current lock intact.
+
+The manual-acquisition panel shows clicked-frame processing, catching up,
+handover, or failure. `Click to live (ms)` measures from HTTP click receipt on
+the Pi to acceptance by the live loop; `Worker to live (ms)` starts at job
+submission. It excludes browser/network time before the Pi receives the click.
+Very fast replays may finish between panel refreshes; their final timing and
+number of replay updates remain visible.
+
+History holds 50 native GREY frames (~65.5 MB). Only one worker runs, newer
+clicks supersede older jobs, and a one-second deadline bounds each job. Replay
+normally advances two captured frames at a time, retrying the intermediate
+frame after a miss. Algorithm disarm or selection changes cancel pending work.
+
+The session's `logs/telemetry/los-*.csv` includes:
+
+| Column | Meaning |
+|---|---|
+| `capture_frame` | Current frame's capture index, counting processing skips |
+| `click_frame` | Capture index of the image displayed when clicked |
+| `click_used_frame` | Live loop frame when the click was picked up (not the historical detection frame) |
+| `click_gap` | Initial pickup gap: `click_used_frame - click_frame` |
+| `click_result` | `queued`; final outcome is in the click-event log |
+| `click_x`, `click_y` | Click coordinates in native camera pixels |
+| `click_match_distance_px` | Reserved; historical match distance is in the click-event log |
+| `replay_status` | Latest acquisition stage/outcome |
+| `replay_clicked_frame`, `replay_frame` | Historical clicked frame and replay progress |
+| `replay_remaining_frames` | Frames behind at latest progress/handover |
+| `replay_click_to_live_ms`, `replay_worker_ms` | Timing of successful handover |
+| `replay_handover_frame` | Live capture index that accepted the new lock |
+
+Click columns are populated only on the attempt's row. Capture indices start at
+1 for each camera instance and continue across algorithm re-arms; compare them
+within the same session CSV. They are separate from the tracker `frame` and
+recording `rec_idx`. Old-browser clicks from a previous service instance are
+rejected until a new preview image is displayed.
+
+The separate `clicks-los-<session>.csv`, beside the telemetry CSV, records each
+submission, historical match, cancellation, failure, and successful handover.
+It includes click ID, clicked frame, replay frame, live handover frame, remaining
+gap, steps, elapsed times, match distance and failure details. `historical_match`
+has `replay_frame == click_frame`, showing detection used the clicked image.
+The journal prints the same events as `[click-replay]`. At 25 fps, an initial
+10-frame gap is approximately 400 ms; catch-up duration is measured separately.
+
+## Original latency rig (Jetson)
+
 Data acquisition and latency measurement for a thermal camera rigidly mounted on
 a gimbal, running on a Jetson Orin Nano.
 
