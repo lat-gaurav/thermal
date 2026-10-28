@@ -29,6 +29,7 @@ have a headless equivalent for.
 import argparse
 import base64
 import json
+import socket
 import sys
 import threading
 import time
@@ -470,6 +471,19 @@ def make_handler(session):
     return Handler
 
 
+class DualStackServer(ThreadingHTTPServer):
+    # Plain ThreadingHTTPServer is IPv4-only (AF_INET), so clients that only
+    # have an IPv6 route to this host -- common once v4 and v6 take different
+    # paths through NAT/VPNs -- get connection refused even though 0.0.0.0
+    # "looks like" it covers everything. Binding "::" with IPV6_V6ONLY off
+    # accepts both address families on one socket.
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -497,7 +511,9 @@ def main():
         session = Session(path=args.file)
         label = f"{args.file} ({session.total} frames)"
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(session))
+    bind_host = "::" if args.host in ("0.0.0.0", "") else args.host
+    server_cls = DualStackServer if ":" in bind_host else ThreadingHTTPServer
+    server = server_cls((bind_host, args.port), make_handler(session))
     print(f"serving {label} on http://{args.host}:{args.port}/")
     try:
         server.serve_forever()

@@ -148,7 +148,12 @@ LOS_PROXIMITY_MAX_DIST_PX = 150.0  # how far a detection may sit from the LOS
 # Chosen BY NAME, never by whichever file sorts first: dropping a new .py into
 # initialisation/ used to change what acquires the target, and in flight that
 # must not depend on a filename.
-FLIGHT_INITIALISER = "cue_nearest"         # tools/flight_pipeline.py
+# The operator acquires by hand by default: they watch flight/preview.py and
+# click the target, and the preview's initialiser dropdown comes up on
+# manual_click because that is what the pipeline started with. Switch to
+# cue_nearest from that dropdown (or --initialiser cue_nearest) to hand
+# acquisition back to the radar cue for the rest of the sortie.
+FLIGHT_INITIALISER = "manual_click"        # tools/flight_pipeline.py
 VIEWER_INITIALISER = "rightmost_isolated"  # the offline viewers, which have no
                                            # cue, so the cue-based one could
                                            # never return anything there.
@@ -417,7 +422,7 @@ CUBE_CAM_PITCH_PARAM = "LAT_CAM_PITCH"   # read, cross-checked, never applied he
 # but lives entirely on this side of the wire; nothing reads or writes it on the
 # Cube. Raising it trades a longer dead-reckoned fix for a longer window in which
 # guidance steers on a target that may no longer be there.
-LAT_DET_VALID_TIMEOUT = 0.5    # seconds of coasting still sent as valid=1
+LAT_DET_VALID_TIMEOUT = 1.0    # seconds of coasting still sent as valid=1
 
 # ===========================================================================
 # 9. THE RC SWITCHES   (flight/rc_arm.py)

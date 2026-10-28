@@ -34,9 +34,10 @@ posts the click's pixel in the JPEG's own (post-scale) coordinate space to
 /api/click, and click_point() below divides that back by PREVIEW_SCALE so
 every consumer downstream works in the camera's native frame, same as every
 box and the cue point. That point only DOES something if the pipeline is
-running with --initialiser manual_click (initialisation/manual_click.py); with
-any other initialiser loaded, a click is accepted, stored, and simply never
-read by anything -- harmless, not wired to the tracker.
+running with the manual_click initialiser (initialisation/manual_click.py),
+which is the default (config.FLIGHT_INITIALISER); with another one selected in
+the initialiser dropdown, a click is accepted, stored, and simply never read by
+anything -- harmless, not wired to the tracker.
 
 RUNTIME CONTROLS. The page can also arm the algorithm and hot-swap the
 detector/initialiser, over POST /api/control:
@@ -56,6 +57,7 @@ set_options(), from whatever tools/flight_pipeline.py actually loaded).
 """
 import json
 import pathlib
+import socket
 import sys
 import threading
 import time
@@ -130,7 +132,7 @@ _INDEX = b"""<!doctype html><html><head><meta charset="utf-8">
 <div id="wrap">
   <div id="left">
     <div id="imgbox"><img id="img" src="/stream.mjpg"></div>
-    <div id="clickmsg">click the target to acquire manually (needs --initialiser manual_click)</div>
+    <div id="clickmsg">click the target to acquire manually (needs the manual_click initialiser)</div>
     <div id="ctrl">
       <label>algorithm</label>
       <button id="algoBtn" onclick="toggleAlgo()">...</button>
@@ -171,7 +173,7 @@ _INDEX = b"""<!doctype html><html><head><meta charset="utf-8">
         : "click rejected: " + (await resp.text());
     } catch (e) { msg.textContent = "click failed: " + e; }
     setTimeout(() => { msg.textContent =
-      "click the target to acquire manually (needs --initialiser manual_click)"; },
+      "click the target to acquire manually (needs the manual_click initialiser)"; },
       2500);
   });
 })();
@@ -302,6 +304,11 @@ async function tick(){
 }
 tick(); setInterval(tick, 400);
 </script></body></html>"""
+
+
+class _DualStackHTTPServer(ThreadingHTTPServer):
+    """Binds AF_INET6 so a single socket on "::" serves v4 and v6 clients."""
+    address_family = socket.AF_INET6
 
 
 class Preview:
@@ -472,7 +479,10 @@ class Preview:
         self._encoder = threading.Thread(target=self._encode_loop, name="preview",
                                          daemon=True)
         self._encoder.start()
-        self._server = ThreadingHTTPServer(("0.0.0.0", self.port), _make_handler(self))
+        # "::" with IPV6_V6ONLY off (the OS default) accepts v4 AND v6 clients
+        # on one socket -- needed because some networks (CGNAT hotspots) only
+        # route v6 between devices, while "0.0.0.0" would answer v4-only.
+        self._server = _DualStackHTTPServer(("::", self.port), _make_handler(self))
         self._server.daemon_threads = True
         self._server_thread = threading.Thread(target=self._server.serve_forever,
                                                name="preview-http", daemon=True)

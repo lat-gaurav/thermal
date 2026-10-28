@@ -8,14 +8,15 @@ provided it is within MANUAL_CLICK_MAX_PX. No pending click, or nothing near
 it, means no acquisition this frame -- which is the correct answer, not a
 failure, exactly as in cue_nearest.
 
-WHY THIS EXISTS ALONGSIDE cue_nearest, NOT INSTEAD OF IT. The radar cue is
-what flies operationally: it needs no one watching a screen. This is the
-manual fallback for a bench check, a sortie with no radar cue at all, or a
-scene where the automatic rule (nearest-to-cue, or rightmost-isolated) picks
-the wrong blob out of a clutter field and a human can tell at a glance which
-one is real. Select it with --initialiser manual_click (or THERMAL_INITIALISER
-in /etc/default/thermal-live) -- it does not replace FLIGHT_INITIALISER's
-default.
+WHY THIS EXISTS ALONGSIDE cue_nearest, NOT INSTEAD OF IT. This is
+FLIGHT_INITIALISER's default, so a sortie starts with acquisition under the
+operator's hand: a bench check, a sortie with no radar cue at all, or a scene
+where the automatic rule (nearest-to-cue, or rightmost-isolated) picks the
+wrong blob out of a clutter field and a human can tell at a glance which one
+is real. cue_nearest remains what flies operationally once the operator hands
+acquisition back to it -- it needs no one watching a screen -- from the
+preview's initialiser dropdown, --initialiser cue_nearest, or
+THERMAL_INITIALISER in /etc/default/thermal-live.
 
 WHAT THIS DELIBERATELY DOES NOT DO. Same as cue_nearest: it does not move,
 weight, or filter any detection, and it does not substitute the click for

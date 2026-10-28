@@ -220,7 +220,9 @@ weights, or substitutes for a real detection; it only *chooses between*
 detections the detector already found. "No cue, or nothing near it" returns
 `None`, which is the correct answer, not a failure.
 
-- **`cue_nearest.py`** — **the flight default** (`config.FLIGHT_INITIALISER`).
+- **`cue_nearest.py`** — the automatic, radar-driven rule: select it from the
+  preview's initialiser dropdown, with `--initialiser cue_nearest`, or with
+  `THERMAL_INITIALISER=cue_nearest`.
   Acquires the detection nearest where the Cube's radar cue
   (`GCS_TARGET_BEARING`) projects to. Replaces `rightmost_isolated` for flight
   because, against ~13 false alarms/frame on real footage, that one locked
@@ -231,11 +233,15 @@ detections the detector already found. "No cue, or nothing near it" returns
   rightmost detection that is spatially isolated from every other candidate
   (sky is on the right of this rig's rolled mount; a distant target should
   show up alone out there).
-- **`manual_click.py`** — acquires the detection nearest an operator's click on
-  the live preview (`flight/preview.py`). Selected via `--initialiser
-  manual_click` or `THERMAL_INITIALISER=manual_click`; the bench/no-radar
-  fallback, or an override when the automatic rule picks the wrong blob out of
-  a clutter field.
+- **`manual_click.py`** — **the flight default** (`config.FLIGHT_INITIALISER`),
+  so the preview comes up with acquisition under the operator's hand: it
+  acquires the detection nearest an operator's click on the live preview
+  (`flight/preview.py`). The bench/no-radar case, and the answer when the
+  automatic rule picks the wrong blob out of a clutter field. Hand acquisition
+  back to the radar by selecting `cue_nearest` in that same dropdown.
+
+  Note it only acquires **while a cue is arriving**: with no cue at all,
+  acquisition goes to `CUELESS_INITIALISER` below, whatever this is set to.
 
 `config.CUELESS_INITIALISER` (default `rightmost_isolated`) is what runs when
 the radar cue is entirely absent, so a dead radar link doesn't silently zero
