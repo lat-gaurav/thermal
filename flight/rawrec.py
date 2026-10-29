@@ -40,6 +40,34 @@ IT REFUSES BEFORE THE CARD FILLS. Raw is ~118 GB/hour at 25 fps, so a long
 sortie will hit the end of the disk. open() refuses if less than reserve_mb is
 free, and the writer stops cleanly at that threshold instead of letting a full
 disk take the CSV log or the pipeline down with it.
+
+COMPRESSION (config.RAW_COMPRESS = "zstd"), and why it exists. The SD card on the
+airframe sustains ~29.5 MB/s when cool and ~24 MB/s when hot (disk_soak.py,
+2026-10-28), and raw 1280x1024 GREY at 25 fps needs 32.8 MB/s -- so uncompressed
+recording on the card drops 10-22% of frames no matter how the page cache is
+tuned. zstd level 1 shrinks real thermal frames ~2.1x (measured on flight
+20261027-182012: 15.3 MB/s needed) at ~8.6 ms/frame on one Pi 5 core.
+
+The file is then <name>.rawrec.zst, and it is EXACTLY the .rawrec above, cut
+into independent zstd frames: one for the 4096-byte header, one per record.
+
+    zstd -d flight-S-01.rawrec.zst            -> byte-identical flight-S-01.rawrec
+    tools/rawrec_unzst.py flight-S-01.rawrec.zst   (same, and survives a cut tail)
+
+So every existing reader keeps working on the decompressed file, and the crash
+property is kept: each record is a complete zstd frame the moment it is written,
+so a power cut loses at most the record being written, never the file.
+
+Compression runs on its OWN thread, between the camera's queue and the disk
+writer, so compress time and disk-blocked time overlap instead of adding up.
+Lossless: the decompressed pixels are the bytes the sensor sent.
+
+THE OTHER HALF OF THE FIX IS NOT IN THIS FILE. With Linux's default write-back
+(dirty_background_ratio 10 / dirty_ratio 20 of 7.9 GB RAM) the kernel let ~650 MB
+pile up and then flushed it in one go; os.write() blocked for 5.5-8.3 s every ~48 s
+(disk_soak, 2026-10-29). deploy/90-flight-writeback.conf caps dirty data at
+32/128 MB so it trickles out continuously: max write block fell to 246 ms and the
+queue peaked at 6 of 250 frames. Without it, a 2 s queue overflows.
 """
 import json
 import os
@@ -50,6 +78,11 @@ import threading
 import time
 import zlib
 from collections import deque
+
+try:                                  # Debian: sudo apt install python3-zstandard
+    import zstandard as _zstd
+except Exception:                     # recorder must still run without it
+    _zstd = None
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -66,10 +99,14 @@ _FILE_FMT = "<8sIIIIII8sddI"
 
 
 class RawRecWriter:
-    """One .rawrec file. Thread-safe for one producer and this object's writer thread."""
+    """One .rawrec (or .rawrec.zst) file.
+
+    Three threads touch it: ONE producer calling offer() (the camera thread), the
+    compressor thread and the writer thread. offer() never blocks.
+    """
 
     def __init__(self, path, width, height, bpp=1, pixfmt=None, meta=None,
-                 qdepth=None, reserve_mb=None, max_gb=None):
+                 qdepth=None, reserve_mb=None, max_gb=None, compress=None, level=None):
         self.path = str(path)
         self.w, self.h, self.bpp = int(width), int(height), int(bpp)
         self.pixfmt = str(config.CAMERA_FOURCC if pixfmt is None else pixfmt)
@@ -81,17 +118,50 @@ class RawRecWriter:
                                  else reserve_mb) * 1_000_000
         self.max_bytes = int((config.RAW_MAX_GB if max_gb is None else max_gb) * 1e9)
 
+        comp = str(getattr(config, "RAW_COMPRESS", "") if compress is None else compress or "")
+        comp = comp.strip().lower()
+        self.warning = ""
+        if comp not in ("", "none", "zstd"):
+            raise ValueError("RAW_COMPRESS must be '' or 'zstd', not %r" % comp)
+        if comp == "zstd" and _zstd is None:
+            self.warning = ("zstandard not installed -- recording UNCOMPRESSED "
+                            "(sudo apt install python3-zstandard)")
+            comp = ""
+        self.compress = "zstd" if comp == "zstd" else ""
+        self.level = int(getattr(config, "RAW_ZSTD_LEVEL", 1) if level is None else level)
+        if self.compress and not self.path.endswith(".zst"):
+            self.path += ".zst"
+        # One compressor, used only by the compressor thread (and by open()
+        # for the header, before that thread exists). ZstdCompressor is not
+        # safe to share between threads concurrently; it is never shared.
+        self._cctx = (_zstd.ZstdCompressor(level=self.level, write_checksum=True,
+                                           write_content_size=True)
+                      if self.compress else None)
+
         self._fd = None
-        self._q = deque()
+        self._q = deque()             # raw records, filled by offer()
+        self._zq = deque()            # encoded records, drained by the writer
         self._lock = threading.Lock()
-        self._wake = threading.Event()
-        self._thread = None
-        self._closed = False
+        self._wake = threading.Event()    # something for the compressor
+        self._zwake = threading.Event()   # something for the writer
+        self._zroom = threading.Event()   # the writer made room in _zq
+        self._threads = []
+        self._closed = False          # no more offers accepted
+        self._abort = False           # stop everything now (error / limit)
+        self._enc_done = False        # compressor has drained and exited
         self._seq = 0
-        self.frames = 0
+        self.frames = 0               # records on disk
         self.offered = 0
         self.dropped = 0
-        self.bytes_written = 0
+        self.bytes_written = 0        # logical .rawrec bytes on disk (what decompresses out)
+        self.bytes_disk = 0           # bytes actually written to the card
+        self.encode_ms_sum = 0.0
+        # write-path diagnostics: how long the card made us wait
+        self.t_open = time.monotonic()
+        self.write_ms = []          # duration of every os.write
+        self.stalls = []            # (t_since_open, ms) for writes > 100 ms
+        self.drop_times = []        # t_since_open of each dropped frame
+        self.q_max = 0
         self.stop_reason = ""
 
     # ---- lifecycle ----------------------------------------------------------
@@ -108,15 +178,23 @@ class RawRecWriter:
                           % (free / 1e9, self.reserve_bytes / 1e9, d))
         self._fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         self._write_header()
-        self._thread = threading.Thread(target=self._writer, name="rawrec", daemon=True)
-        self._thread.start()
+        for target, name in ((self._encoder, "rawrec-enc"), (self._writer, "rawrec")):
+            t = threading.Thread(target=target, name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
         return self
+
+    def _encode(self, buf):
+        return self._cctx.compress(bytes(buf)) if self._cctx is not None else buf
 
     def _write_header(self):
         meta = dict(self.meta)
         meta.update({"width": self.w, "height": self.h, "bpp": self.bpp,
                      "pixfmt": self.pixfmt, "rec_len": self.rec_len,
                      "frame_bytes": self.frame_bytes})
+        if self.compress:
+            # Lets a reader of the decompressed file know it came from a .zst.
+            meta.update({"container": "zstd", "zstd_level": self.level})
         js = json.dumps(meta, sort_keys=True).encode()[:HDR_LEN - 128]
         h = bytearray(HDR_LEN)
         struct.pack_into(_FILE_FMT, h, 0, MAGIC_FILE, HDR_LEN, self.rec_len,
@@ -124,17 +202,21 @@ class RawRecWriter:
                          self.pixfmt.encode().ljust(8, b"\0"),
                          time.time(), time.monotonic(), len(js))
         h[128:128 + len(js)] = js
-        os.write(self._fd, h)
+        out = self._encode(h)
+        os.write(self._fd, out)
         self.bytes_written += HDR_LEN
+        self.bytes_disk += len(out)
 
     def close(self):
         """Flush what is queued and report. The file was already readable throughout."""
-        if self._closed:
-            return self.stats()
-        self._closed = True
+        if not self._closed:
+            self._closed = True
         self._wake.set()
-        if self._thread is not None:
-            self._thread.join(timeout=config.RAW_CLOSE_TIMEOUT_S)
+        self._zwake.set()
+        deadline = time.monotonic() + config.RAW_CLOSE_TIMEOUT_S
+        for t in self._threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        self._threads = []
         if self._fd is not None:
             try:
                 os.fsync(self._fd)
@@ -143,6 +225,14 @@ class RawRecWriter:
             os.close(self._fd)
             self._fd = None
         return self.stats()
+
+    def _stop(self, reason):
+        self.stop_reason = self.stop_reason or reason
+        self._abort = True
+        self._closed = True
+        self._wake.set()
+        self._zwake.set()
+        self._zroom.set()
 
     # ---- producer side ------------------------------------------------------
     def offer(self, frame, t_mono=None, t_wall=None, flags=0):
@@ -167,49 +257,92 @@ class RawRecWriter:
         with self._lock:
             if len(self._q) >= self.qdepth:
                 self.dropped += 1
+                self.drop_times.append(time.monotonic() - self.t_open)
                 return False
             self._q.append(rec)
+            self.q_max = max(self.q_max, len(self._q))
         self._wake.set()
         return True
+
+    # ---- compressor thread --------------------------------------------------
+    def _encoder(self):
+        """_q -> zstd -> _zq. Waits (never drops) when the writer is behind:
+        backpressure lands on _q, where offer() drops and counts."""
+        try:
+            while not self._abort:
+                with self._lock:
+                    rec = self._q.popleft() if self._q else None
+                if rec is None:
+                    if self._closed:
+                        return
+                    self._wake.wait(0.05)
+                    self._wake.clear()
+                    continue
+                t0 = time.perf_counter()
+                out = self._encode(rec)
+                self.encode_ms_sum += 1000.0 * (time.perf_counter() - t0)
+                while not self._abort:
+                    with self._lock:
+                        if len(self._zq) < self.qdepth:
+                            self._zq.append(out)
+                            break
+                    self._zroom.wait(0.05)
+                    self._zroom.clear()
+                self._zwake.set()
+        except Exception as e:                      # never let it die silently
+            self._stop("compressor failed: %s" % e)
+        finally:
+            self._enc_done = True
+            self._zwake.set()
 
     # ---- writer thread ------------------------------------------------------
     def _writer(self):
         check_every = config.RAW_DISK_CHECK_FRAMES
-        while True:
+        while not self._abort:
             with self._lock:
-                rec = self._q.popleft() if self._q else None
-            if rec is None:
-                if self._closed:
+                out = self._zq.popleft() if self._zq else None
+            if out is None:
+                if self._enc_done:
                     return
-                self._wake.wait(0.05)
-                self._wake.clear()
+                self._zwake.wait(0.05)
+                self._zwake.clear()
                 continue
+            self._zroom.set()
             try:
-                os.write(self._fd, rec)
+                tw0 = time.monotonic()
+                os.write(self._fd, out)
+                ms = 1000.0 * (time.monotonic() - tw0)
+                self.write_ms.append(ms)
+                if ms > 100:
+                    self.stalls.append((tw0 - self.t_open, ms))
             except OSError as e:
-                self.stop_reason = "write failed: %s" % e
-                self._closed = True
+                self._stop("write failed: %s" % e)
                 return
             self.frames += 1
             self.bytes_written += self.rec_len
-            if self.max_bytes and self.bytes_written >= self.max_bytes:
-                self.stop_reason = "max size reached"
-                self._closed = True
+            self.bytes_disk += len(out)
+            if self.max_bytes and self.bytes_disk >= self.max_bytes:
+                self._stop("max size reached")
                 return
             # Stop BEFORE the card fills, so a full disk cannot take the CSV log
             # or the pipeline down with it.
             if self.frames % check_every == 0:
                 st = os.fstatvfs(self._fd)
                 if st.f_bavail * st.f_frsize <= self.reserve_bytes:
-                    self.stop_reason = "disk reserve reached"
-                    self._closed = True
+                    self._stop("disk reserve reached")
                     return
 
     # ---- reporting ----------------------------------------------------------
     def stats(self):
+        n = max(1, self.frames)
         return {"path": self.path, "frames": self.frames, "offered": self.offered,
                 "dropped": self.dropped, "gb": self.bytes_written / 1e9,
-                "stop_reason": self.stop_reason}
+                "gb_disk": self.bytes_disk / 1e9,
+                "ratio": (self.bytes_written / self.bytes_disk) if self.bytes_disk else 1.0,
+                "compress": ("zstd-%d" % self.level) if self.compress else "none",
+                "encode_ms": self.encode_ms_sum / n,
+                "queued": len(self._q), "queued_encoded": len(self._zq),
+                "stop_reason": self.stop_reason, "warning": self.warning}
 
     @property
     def active(self):

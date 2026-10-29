@@ -471,12 +471,24 @@ RAW_RESERVE_MB_FALLBACK = 8192  # a bigger floor when writing to the SD card
                                 # rather than the SSD, because that is the ROOT
                                 # filesystem: running it dry does not merely lose
                                 # the recording, it can take the system down.
-RAW_QDEPTH_FRAMES = 8       # bounded queue between the camera thread and the
+RAW_QDEPTH_FRAMES = 50      # bounded queue between the camera thread and the
                             # writer. Full means the frame is DROPPED and
                             # counted: falling behind on disk must cost
                             # recording quality and nothing else -- never a
                             # dropped camera frame, never a stalled tracker.
-                            # 8 frames is ~10.5 MB of buffer.
+                            # 50 frames = 2 s = ~66 MB of RAM (was 8 = 0.32 s).
+                            # With deploy/90-flight-writeback.conf installed the
+                            # SD card's longest write block was 246 ms and the
+                            # queue peaked at 6 frames; without it the kernel
+                            # stalls writes for 5-8 s and 2 s is not enough.
+RAW_COMPRESS = "zstd"       # "zstd": write <name>.rawrec.zst, lossless, ~2.3x
+                            # smaller on real thermal frames (14 MB/s to the card
+                            # instead of 32.8, which the SD card cannot sustain:
+                            # ~29.5 MB/s measured). "" = plain .rawrec as before.
+                            # Needs python3-zstandard; without it the recorder
+                            # falls back to plain and says so.
+                            # Decompress for the viewers: tools/rawrec_unzst.py
+RAW_ZSTD_LEVEL = 1          # 1 = fastest, ~9.5 ms/frame on a Pi 5 core
 RAW_MAX_GB = 0.0            # hard cap per episode, 0 = none
 RAW_DISK_CHECK_FRAMES = 200  # how often the writer re-checks free space. At
                              # ~79 MB/s it can overshoot the reserve by ~250 MB

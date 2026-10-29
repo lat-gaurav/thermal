@@ -143,6 +143,32 @@ def devnum_of(usbdir):
         return None
 
 
+def load_sample(path, W, H, n_max=120):
+    """Up to n_max real frames spread across a .rawrec / .rawrec.zst, as arrays."""
+    import struct
+    frames = []
+    if path.endswith(".zst"):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from rawrec_unzst import frames as zframes
+        with open(path, "rb") as f:
+            for i, blob in enumerate(zframes(f)):
+                if i == 0:
+                    continue
+                if len(frames) >= n_max:
+                    break
+                if i % 5 == 0:
+                    frames.append(np.frombuffer(blob[32:], np.uint8).reshape(H, W).copy())
+        return frames
+    with open(path, "rb") as f:
+        hdr = f.read(4096)
+        rec_len = struct.unpack_from("<I", hdr, 12)[0]
+        n = (os.path.getsize(path) - 4096) // rec_len
+        for k in np.linspace(0, n - 1, min(n_max, n)).astype(int):
+            f.seek(4096 + int(k) * rec_len + 32)
+            frames.append(np.frombuffer(f.read(W * H), np.uint8).reshape(H, W).copy())
+    return frames
+
+
 # --------------------------------------------------------------------------- #
 # the run
 # --------------------------------------------------------------------------- #
@@ -166,6 +192,14 @@ def main():
                          "same time, and the recorder is fed from the grab thread "
                          "exactly as flight_pipeline.py feeds it."
                          % config.CAMERA_DEVICE)
+    ap.add_argument("--sample", metavar="RAWREC",
+                    help="feed REAL thermal frames, cycled from this .rawrec or "
+                         ".rawrec.zst, instead of random noise. Needed to judge "
+                         "compression: noise does not compress, sky and ground do.")
+    ap.add_argument("--qdepth", type=int, default=None,
+                    help="recorder queue in frames (default config.RAW_QDEPTH_FRAMES)")
+    ap.add_argument("--no-compress", action="store_true",
+                    help="write plain .rawrec even if config.RAW_COMPRESS is set")
     args = ap.parse_args()
 
     W, H, FPS = args.width, args.height, args.fps
@@ -237,12 +271,27 @@ def main():
         # the test is of the disk, not of numpy.
         rng = np.random.default_rng(0xC0FFEE)
         frame = rng.integers(0, 256, size=(H, W), dtype=np.uint8)
+    sample = load_sample(args.sample, W, H) if (args.sample and cam is None) else None
 
     path = out_dir / ("ssd-soak-%s.rawrec" % time.strftime("%Y%m%d-%H%M%S"))
     rec = RawRecWriter(path, W, H, bpp=1, pixfmt="GREY",
                        reserve_mb=config.RAW_RESERVE_MB,
+                       compress="" if args.no_compress else None, qdepth=args.qdepth,
                        meta={"source": args.camera or "disk_soak",
                              "synthetic": cam is None}).open()
+    path = rec.path               # the writer appends .zst when compressing
+    print("-" * 72)
+    print("recorder")
+    print("  format      %s  (queue %d frames = %.1f s)"
+          % ("zstd-%d -> .rawrec.zst" % rec.level if rec.compress else "plain .rawrec",
+             rec.qdepth, rec.qdepth / FPS))
+    if rec.warning:
+        print("  WARNING     %s" % rec.warning)
+    if rec.compress and cam is None and sample is None:
+        print("  NOTE        random-noise frames do not compress -- this run is the")
+        print("              worst case. Use --sample <a real .rawrec> or --camera.")
+    if sample is not None:
+        print("  frames      %d real frames cycled from %s" % (len(sample), args.sample))
 
     print("-" * 72)
     print("running -- ^C to stop early", flush=True)
@@ -292,9 +341,10 @@ def main():
             return
         last_print = now
         extra = "  grabbed %5d" % cam.grabbed if cam else ""
-        print("  t+%5.1fs  offered %5d  written %5d  DROPPED %d  %.1f MB/s%s"
+        print("  t+%5.1fs  offered %5d  written %5d  DROPPED %d  %.1f MB/s  (disk %.1f MB/s)%s"
               % (now - t0, rec.offered, rec.frames, rec.dropped,
-                 rec.bytes_written / 1e6 / (now - t0), extra), flush=True)
+                 rec.bytes_written / 1e6 / (now - t0),
+                 rec.bytes_disk / 1e6 / (now - t0), extra), flush=True)
 
     try:
         if cam is not None:
@@ -319,7 +369,7 @@ def main():
                 if time.monotonic() - t0 >= args.seconds or bus_fail:
                     break
                 a = time.monotonic()
-                rec.offer(frame, t_mono=a)
+                rec.offer(frame if sample is None else sample[n % len(sample)], t_mono=a)
                 offer_ms.append(1000.0 * (time.monotonic() - a))
                 n += 1
                 if not rec.active:
@@ -349,7 +399,28 @@ def main():
     print("  offered     %d frames (%.2f fps)" % (stats["offered"], stats["offered"] / elapsed))
     print("  written     %d frames, %.2f GB (%.2f MB/s)"
           % (stats["frames"], stats["gb"], stats["gb"] * 1000 / elapsed))
+    print("  on disk     %.2f GB (%.2f MB/s)  ratio %.2fx  [%s]  encode %.1f ms/frame"
+          % (stats["gb_disk"], stats["gb_disk"] * 1000 / elapsed, stats["ratio"],
+             stats["compress"], stats["encode_ms"]))
     print("  DROPPED     %d" % stats["dropped"])
+    wm = sorted(rec.write_ms)
+    if wm:
+        q = lambda p: wm[min(len(wm) - 1, int(p * len(wm)))]
+        print("  write()     p50 %.1f ms  p99 %.1f ms  max %.0f ms   queue peak %d/%d frames"
+              % (q(.5), q(.99), wm[-1], rec.q_max, rec.qdepth))
+        print("  stalls      %d writes >100 ms, %d >500 ms, %d >1 s, %d >2 s"
+              % (sum(m > 100 for m in wm), sum(m > 500 for m in wm),
+                 sum(m > 1000 for m in wm), sum(m > 2000 for m in wm)))
+        for t, ms in sorted(rec.stalls, key=lambda x: -x[1])[:8]:
+            print("              t+%6.1fs  write blocked %5.0f ms" % (t, ms))
+    if rec.drop_times:
+        bursts, last = [], -9
+        for t in rec.drop_times:
+            if t - last > 1.0:
+                bursts.append([t, 0])
+            bursts[-1][1] += 1
+            last = t
+        print("  drop bursts %s" % ", ".join("t+%.0fs:%d" % (a, n) for a, n in bursts[:12]))
     if cam is not None:
         print("  camera      %d grabbed, %d read failures" % (cam.grabbed, cam.read_fail))
     if offer_ms:
